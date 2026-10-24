@@ -1,0 +1,6 @@
+model,task,accuracy,macro_f1,unknown_predictions
+hog_svm,ground-truth crop classification,0.6813151041666666,0.6910289717722726,0
+yolov5u_n,ground-truth crop classification,0.3382161458333333,0.2885053313999262,0
+yolov8_n,ground-truth crop classification,0.3997395833333333,0.308270470737406,0
+yolov8_n_lr0003,ground-truth crop classification,0.4619140625,0.38430810347580874,2
+yolov8_n_lr0003_coloraug,ground-truth crop classification,0.3037109375,0.2111786107201244,3

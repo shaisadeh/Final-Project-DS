@@ -1,0 +1,13 @@
+{
+  "chosen_model": "yolov8_n_lr0003_coloraug",
+  "thresholds": {
+    "yolov5u_n": 0.15,
+    "yolov8_n": 0.15,
+    "yolov8_n_lr0003": 0.25,
+    "yolov8_n_lr0003_coloraug": 0.01
+  },
+  "matching_iou": 0.5,
+  "nms_iou": 0.7,
+  "mapping_verified": true,
+  "selection": "validation only; targets met, then D40 recall, then mAP50, then YOLOv8 tie-break"
+}

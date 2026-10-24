@@ -1,0 +1,16 @@
+{
+  "original": {
+    "0": "Class_0",
+    "1": "Class_1",
+    "2": "Class_2",
+    "3": "Class_3"
+  },
+  "used": {
+    "0": "D20",
+    "1": "D00",
+    "2": "D40",
+    "3": "D10"
+  },
+  "status": "Original Roboflow YAML supplied by user; repository preprocessing preserves numeric class IDs.",
+  "verified": true
+}
