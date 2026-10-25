@@ -1,0 +1,33 @@
+# ==============================================================================
+# RoadGuard DS23 Capstone Project - Core Dependencies
+# Python Target: >= 3.10, < 3.13
+# Modules: RAG, Embeddings, Ingestion, OCR, Evaluation & Agent Interface
+# ==============================================================================
+
+# --- 1. Vector Database & Semantic Embeddings (Sessions 38 & 40) ---
+chromadb>=0.4.24
+sentence-transformers>=2.6.0
+
+# --- 2. LLM APIs & Model Inference (Sessions 37, 38 & 42) ---
+openai>=1.20.0
+google-genai>=0.1.0
+
+# --- 3. Document Parsing & Extraction ---
+pypdf>=4.1.0
+python-docx>=1.1.0
+
+# --- 4. OCR Fallback for Scanned PDFs ---
+# Note: Requires system packages on Linux/Colab:
+# apt-get install -y tesseract-ocr tesseract-ocr-heb poppler-utils
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+Pillow>=10.2.0
+
+# --- 5. Translation Utilities (Bilingual Pipeline) ---
+deep-translator>=1.11.4
+
+# --- 6. Data Analysis, Evaluation & Benchmarking (Sessions 7, 8 & 41) ---
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
