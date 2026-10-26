@@ -25,7 +25,6 @@ The second script at the first section conducts a structural audit of the direct
 
 the following output describe the files structure for the initial datas:
 
-Starting directory structure analysis and file verification...
 ------------------------------------------------------------
 Directory Structure:
 extracted_roboflow/
@@ -73,7 +72,7 @@ Total configuration files (YAML): 1
 
 # 2. Database Consolidation and Group-Stratified Splitting
 
-The third Python script executes an automated pipeline to consolidate the multi-folder source structure into a centralized runtime storage tier. It resolves the detected label asymmetry by enforcing an explicit synchronized filter, ensuring only verified image-annotation pairs pass through the mapping arrays to prevent empty references during dataset compilation.
+The third Python script at the second section executes an automated pipeline to consolidate the multi-folder source structure into a centralized runtime storage tier. It resolves the detected label asymmetry by enforcing an explicit synchronized filter, ensuring only verified image-annotation pairs pass through the mapping arrays to prevent empty references during dataset compilation.
 
 The algorithm applies a strict group-level extraction based on the stripped original file sequences to eliminate downstream statistical data leakage. It performs a structured split that isolates frames of identical damage sequences together, distributing the final dataset across decoupled training, validation, and testing tiers. Due to the large scale of the base dataset, splitting data by randomized camera sequences yields an optimal statistical convergence, achieving a stable class stratification proxy that balances category weight proportions between folds without causing data leakage.
 
@@ -127,7 +126,7 @@ Following configuration discovery and inventory validation, the runtime script c
 *   **Atomic Storage Synchronization:** Executes an isolated `shutil.move` block post-compression, dispatching the serialized package to persistent cloud infrastructures while concurrently liberating localized Google Colab workspace storage sectors.
 
 output for this section:
-Starting final dataset structure analysis and file configuration inventory...
+
 ---------------------------------------------------------------------------
 Decoupled Directory Layout:
 road_damage_detect/
