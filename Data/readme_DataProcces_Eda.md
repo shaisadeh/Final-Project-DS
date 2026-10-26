@@ -227,20 +227,20 @@ To provide the empirical foundation for the verification targets detailed above,
 # 5.0 Results
 ======================================== TABLE 1: CLASS DISTRIBUTION & STRATIFICATION ========================================
      Train (Original)  Train (Augmented)  Train (Total)  Val  Test  Train (Original) (%)  Train (Augmented) (%)  Train (Total) (%)  Val (%)  Test (%)
-D00              4891               4891           9782  871  1041                 33.40                  33.42              33.41    32.67     33.89
-D10              3848               3845           7693  753   805                 26.28                  26.27              26.28    28.24     26.20
-D20              3338               3336           6674  561   675                 22.79                  22.80              22.80    21.04     21.97
-D40              2567               2562           5129  481   551                 17.53                  17.51              17.52    18.04     17.94
+D20              4891               4890           9781  871  1041                 33.40                  33.42              33.41    32.67     33.89
+D00              3848               3847           7695  753   805                 26.28                  26.29              26.28    28.24     26.20
+D40              3338               3332           6670  561   675                 22.79                  22.77              22.78    21.04     21.97
+D10              2567               2563           5130  481   551                 17.53                  17.52              17.52    18.04     17.94
 
-Total physical images disk count -> Train: 14346 | Val: 1265 | Test: 1488
+Total physical images disk count -> Train: 14343 | Val: 1265 | Test: 1488
 
 ======================================== TABLE 2: BOUNDING BOX SPATIAL METRICS PER CLASS ========================================
             Orig Mean Area  Aug Mean Area  Orig Median Area  Aug Median Area  Orig Mean Aspect  Aug Mean Aspect
 class_name                                                                                                     
-D00               50854.59       52293.24          36027.75         36886.59              1.72             1.69
-D10                9619.81        9943.43           5768.62          5938.50              0.85             0.85
-D20                6922.02        7124.96           2511.12          2595.01              1.82             1.78
-D40                5620.15        6171.83           3671.25          3968.07              5.42             5.02
+D00                9619.81        9985.58           5768.62          5956.85              0.85             0.85
+D10                5620.15        6194.46           3671.25          3946.15              5.42             4.99
+D20               50854.59       52294.75          36027.75         37278.84              1.72             1.69
+D40                6922.02        7195.79           2511.12          2607.04              1.82             1.78
 
 (graphs in notebook file)
 
@@ -252,10 +252,10 @@ This analytical review evaluates the physical footprint of the processed dataset
 
 Table 1 (Class Distribution and Stratification Profile) and Graph 1 (Object Class Distribution Across Dataset Partitions) evaluate class representation balances between folds. The dataset contains 35,016 total bounding box objects across all partitions (Train, Val, and Test), distributed across four distinct target codes.
 
-*   **D00 (Longitudinal Cracks):** Measures 33.41% in Train (Total), 32.67% in Val, and 33.89% in Test.
-*   **D10 (Transverse Cracks):** Measures 26.28% in Train (Total), 28.24% in Val, and 26.20% in Test.
-*   **D20 (Alligator Cracks):** Measures 22.80% in Train (Total), 21.04% in Val, and 21.97% in Test.
-*   **D40 (Potholes):** Measures 17.52% in Train (Total), 18.04% in Val, and 17.94% in Test.
+*   **D20 (Alligator Cracks):** Measures 33.41% in Train (Total), 32.67% in Val, and 33.89% in Test.
+*   **D00 (Longitudinal Cracks):** Measures 26.28% in Train (Total), 28.24% in Val, and 26.20% in Test.
+*   **D40 (Potholes):** Measures 22.80% in Train (Total), 21.04% in Val, and 21.97% in Test.
+*   **D10 (Transverse Cracks):** Measures 17.52% in Train (Total), 18.04% in Val, and 17.94% in Test.
 
 The maximum alignment delta between the folds does not exceed 1.96% for any class. This close alignment proves that splitting by camera sequence groups achieves a stable class stratification proxy across training, validation, and testing tiers. The natural statistical convergence handles class imbalance safely without creating any data leakage, providing a verified environment where evaluation fold distributions accurately mirror the training set.
 
@@ -277,9 +277,9 @@ This exact statistical identity proves that the augmentation loop preserved the 
 
 Table 2 (Bounding Box Spatial Metrics Per Class), Graph 3A (Bounding Box Width Density Distribution), and Graph 3B (Bounding Box Height Density Distribution) cross-examine object dimension boundaries between original and augmented sets.
 
-*   **D00 (Longitudinal Cracks):** Average area measures 50,854.59 pixels (Original) versus 52,293.24 pixels (Augmented). The average aspect ratio remains stable at 1.72 (Original) versus 1.69 (Augmented), confirming the structural preservation of elongated longitudinal features.
-*   **D10 (Transverse Cracks):** Average aspect ratio remains fixed at 0.85 across both folds. This consistent profile verifies that spatial constraints successfully prevented perpendicular feature distortion during augmentation.
-*   **D40 (Potholes):** Average area measures 5,620.15 pixels (Original) versus 6,171.83 pixels (Augmented). It represents a structurally compact category but features the highest width-to-height aspect ratio profile (5.42 Original / 5.02 Augmented) due to wide camera angles capturing flat, horizontal perspective compressions on the road surface.
+*   **D20 (Alligator Cracks):** Average area measures 50,854.59 pixels (Original) versus 52,293.24 pixels (Augmented). The average aspect ratio remains stable at 1.72 (Original) versus 1.69 (Augmented), confirming the structural preservation of elongated Alligator features.
+*   **D00 (Longitudinal Cracks):** Average aspect ratio remains fixed at 0.85 across both folds. This consistent profile verifies that spatial constraints successfully prevented perpendicular feature distortion during augmentation.
+*   **D10 (Transverse Cracks):** Average area measures 5,620.15 pixels (Original) versus 6,171.83 pixels (Augmented). It represents a structurally compact category but features the highest width-to-height aspect ratio profile (5.42 Original / 5.02 Augmented) due to wide camera angles capturing flat, horizontal perspective compressions on the road surface.
 
 ### Kernel Density Estimation (KDE) Dimension Analysis
 
