@@ -250,7 +250,7 @@ This analytical review evaluates the physical footprint of the processed dataset
 
 ## Categorical Stratification Analysis
 
-Table 1 (Class Distribution and Stratification Profile) and Graph 1 (Object Class Distribution Across Dataset Partitions) evaluate class representation balances between folds. The dataset contains 32,341 total bounding box objects across all partitions (Train, Val, and Test), distributed across four distinct target codes.
+Table 1 (Class Distribution and Stratification Profile) and Graph 1 (Object Class Distribution Across Dataset Partitions) evaluate class representation balances between folds. The dataset contains 35,016 total bounding box objects across all partitions (Train, Val, and Test), distributed across four distinct target codes.
 
 *   **D00 (Longitudinal Cracks):** Measures 33.41% in Train (Total), 32.67% in Val, and 33.89% in Test.
 *   **D10 (Transverse Cracks):** Measures 26.28% in Train (Total), 28.24% in Val, and 26.20% in Test.
