@@ -1,0 +1,97 @@
+# Decision policy for the RoadGuard triage agents.
+#
+# This file is the single source of truth for the decision rules.
+# The deterministic rule tree (_decide_rule_based) consumes these
+# values at import time; the Decision system prompt is rendered from
+# them (so the LLM and the tree share one policy).
+#
+# Bump `version` on every substantive rule change. The version string
+# is included in the Decision prompt and in each trace entry so a
+# reviewer can tell which policy produced a given verdict.
+
+version: "2026.10.31"
+charter_grounding_target_pct: 90
+
+severity:
+  # profile_builder thresholds for the severity_signal.
+  d40_main_lane_blocked: "severe"
+  d40_or_d20_large_area_min_ratio: 0.05
+  d40_or_d20_large_area_min_confidence: 0.6
+  d40_or_d20_moderate_min_confidence: 0.5
+  cracks_minor: ["D00", "D10"]
+
+decision:
+  # Preconditions for each action, read by both the rule tree and the
+  # Decision LLM prompt.
+  urgent:
+    hazard_class: ["D40"]
+    road_type: ["main"]
+    lane_blocked: ["partial", "full"]
+    min_confidence: 0.6
+  needs_more_evidence:
+    confidence_range: [0.4, 0.6]
+    requires_no_recurrence: true
+    # One request per hazard. A second needs_more_evidence verdict on the
+    # resumed run becomes human_review (roadmap section 2).
+    max_requests_per_hazard: 1
+  human_review:
+    triggers:
+      - "perception_confidence == low"
+      - "research_coverage == no_match"
+      - "ocr_suspicious == true"
+      - "reporter_text_suspicious == true"
+      - "scene_not_road == true"
+      # The reporter's description names a different class than the
+      # detector found (roadmap section 1). The contradiction is routed
+      # to a human, never resolved by the agent.
+      - "intake_class_contradiction == true"
+  standard:
+    fallback_for: ["anything not covered by urgent/human_review/needs_more_evidence"]
+
+known_image:
+  # A catalogue hit is sealed as known_image (priority 0) only when the bytes
+  # are identical, the recorded detector score and the live detector name the
+  # same class, that class is among the catalogue labels, the recorded score
+  # is at least min_stored_confidence and the frame is not severe. Anything
+  # else runs through the rule tree with the catalogue cited as context; two
+  # detector readings that agree with each other but not with the labels go
+  # to a human (31.10.2026 review, pic_id=13786).
+  min_stored_confidence: 0.4
+
+grounding:
+  # cited_sources must be a subset of research.tool_result_ids, unless
+  # action is in `allow_empty_citations`.
+  allow_empty_citations: ["needs_more_evidence", "human_review", "known_image"]
+  retry_on_fail: 1  # one retry; then fall back to _decide_rule_based
+
+refine_entry:
+  # Decision may ask profile_builder to re-run once with a hint.
+  max_refines: 1
+  triggers:
+    - "perception_confidence == medium AND research_coverage == partial_match"
+
+latency:
+  # Clear-case fast path: profile_builder and rag_retriever skip their
+  # optional LLM refine / relabel when the detector is confident, the image
+  # is usable and the reporter wrote nothing that needs interpreting. The
+  # rule-based profile and the tool-graded coverage stand on their own
+  # there; the LLM pass only lowered confidence on such input (audit 22.10).
+  fast_path:
+    min_detector_confidence: 0.8
+    min_blur_score: 100
+  # Autonomous workers (AGENT_WORKER_AUTONOMY=1): a worker's ReAct loop
+  # stops once it has spent this many seconds and the rule path stands, so
+  # three workers with three hops each cannot eat the run's wall clock.
+  # 1.11.2026 (owner): 90 s, because two calls of a worker on the CPU-only
+  # VM take 15 to 45 s each and 45 s cut one of them in most slow cases.
+  worker_time_cap_s: 90
+
+queues:
+  # Operator queues. An approval pending longer than approval_sla_hours is
+  # marked overdue in /status and in the supervisor inbox (which lists by
+  # priority, then age). An evidence request the reporter has not answered
+  # within evidence_ttl_hours expires and the case goes to a human instead
+  # of hanging in waiting_for_evidence. Rows left in queued/processing by a
+  # restart are routed to a human when the service starts.
+  approval_sla_hours: 24
+  evidence_ttl_hours: 72

@@ -1,0 +1,872 @@
+# Agent Contract
+
+> Layout note (24.10.2026): the runtime code now lives in two modules at the
+> repository root, `roadguard_agent.py` (agent core, settings, SQLite layer,
+> tools, prompts) and `roadguard_api.py` (FastAPI service, operator pages).
+> Paths such as `src/agent/multiagent/nodes/decision.py` below name the
+> former modules; each appears as a `# section:` block of the same name
+> inside those two files. `policy.yaml` sits next to them.
+>
+> Deployment note (24.10.2026): the production deployment on Oracle A1.Flex
+> runs every LLM on a local Ollama instance in Docker. The historical panel
+> providers (Groq, Gemini, Mistral) remain available for benchmarks but are
+> not used in production. The current per-worker assignment is
+> `AGENT_SIGNAL_LLM=ollama:llama3.2:3b`,
+> `AGENT_PERCEPTION_LLM=ollama:qwen2.5:3b`,
+> `AGENT_RESEARCH_LLM=ollama:qwen2.5:3b` (since 31.10.2026; granite3.3:2b never
+> emitted a tool call in 17 autonomous runs),
+> `AGENT_LLM_PROVIDER=ollama:qwen2.5:3b` (Decision; swapped from `7b` to `3b`
+> on 24.10.2026, 3-5x latency win measured on this ARM host).
+
+This document is the authoritative specification for the RoadGuard
+decision agents. It fixes the inputs, the tools, the graph, the policy
+fallbacks, the evidence round trip and the evaluation protocol. Any
+change here is a breaking change for the API, the webapp and the
+evaluation harness. The implementation guide (node by node, with the
+system prompts) is `docs/agents-architecture.md`; the policy values
+themselves live in `policy.yaml` at the repository root.
+
+> Autonomy note (31.10.2026): with `AGENT_WORKER_AUTONOMY=1` (on at the
+> Oracle deployment) the intake, perception and research nodes no longer
+> receive pre-computed answers; each must fetch what it needs through its
+> tools (`extract_measurements`, `inspect_image_quality`,
+> `query_repair_standards`), declares `tools_used` in its reply, and the
+> code verifies the declaration against the tools that ran. The rows
+> below describe the single-call contract that still applies with the
+> flag off; `docs/agent-architecture-audit-2026-10-31.md` section 14 has
+> the autonomous contract and its verification rules.
+
+## 1. Scope and non-goals
+
+The agents recommend one of four actions per hazard. They never:
+
+- close a road,
+- dispatch a contractor,
+- notify a public map or municipal queue,
+- determine engineering severity (depth, structural impact),
+- overwrite the structured fields the reporter chose in the form.
+
+External actions are strictly local. `create_draft_work_order` writes a
+`work_orders` row with `status='draft'`. `flag_for_urgent_review` and the
+approval gate write an `approvals` row and send an internal email to
+the supervisor; nobody outside the system is contacted. The email's
+link carries an HMAC token (`/approvals/{id}?t=...`); the approval page
+and the decide endpoint refuse a missing or wrong token with 403.
+
+## 2. Inputs
+
+`POST /hazards/submit` receives a `HazardSubmit` JSON body:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `class` | enum[D00, D10, D20, D40] | yes | top-1 class from the on-device YOLO run |
+| `confidence` | number [0, 1] | yes | top-1 confidence |
+| `bboxes` | list of [x1, y1, x2, y2, class, conf], max 200 rows, each row at most 6 elements | no | all detections above the client threshold (default `[]`) |
+| `road_type` | enum[main, secondary, bike_path, parking] | yes | user-provided |
+| `lane_blocked` | enum[none, partial, full] | yes | user-provided |
+| `location` | string, max 500 | no | free text, sanitised (vector 1); the API stores the sanitised copy |
+| `reporter_text` | string, max 1000 | no | free text, sanitised (vector 4), read by Intake; the API stores the sanitised copy, never the raw text |
+| `top1_margin`, `area_ratio`, `center_y_rel` | number [0, 1] | no | rich detector signals |
+| `n_detections_by_class` | object keyed by the four classes only | no | counts per class |
+| `image_quality` | object | no | `blur_score`, `brightness_mean`, `is_road_scene`, `road_scene_confidence`, `occlusion_estimate`, `ocr_text_detected` (vector 2, max 2000) |
+
+The server assigns `hazard_id` and `reported_at`. `POST /hazards/live`
+takes the same fields plus `session_id` and `track_id` (one submission
+per confirmed hazard, deduplicated by the server-side decision cache).
+The live path never waits for evidence: it runs with the one evidence
+request already spent, so an ambiguous frame is `human_review`, never
+`waiting_for_evidence`.
+
+Invariants:
+
+- Inputs are validated with pydantic before the graph starts; a
+  validation failure is a 422, never a verdict.
+- The agents never fetch the raw image. All visual signal is in the
+  detector output and the image-quality block.
+- The four free-text channels (`location`, `ocr_text_detected`,
+  `reporter_text`, retrieved RAG passages) are data, never instructions.
+
+## 3. The graph
+
+One LangGraph `StateGraph` (`src/agent/multiagent/graph.py`):
+
+```
+sanitize -> intake -> supervisor -> perception -> supervisor -> research -> supervisor -> decision
+decision -> approval_gate   (urgent / human_review)
+decision -> await_evidence  (needs_more_evidence; interrupt_before, see section 7)
+decision -> END             (standard)
+await_evidence -> sanitize  (resumed run; same photo and form: supervisor -> decision directly)
+```
+
+| Node | LLM | Reads | Writes | Tools |
+|---|---|---|---|---|
+| `sanitize` | no | `location`, `ocr_text_detected`, `reporter_text` | sanitised fields, `*_suspicious` flags | - |
+| `intake` | one call, only when `reporter_text` is non-empty and not flagged | `reporter_text`, detector top-1, form fields | `reporter_intake` (claims, contradictions, `urgency_claimed`), `reporter_signals` (size, depth, swerving vehicles, standing water; section 3.1) | - |
+| `supervisor` | no | `state["budget"]` | `guard_fired`, routing | - |
+| `perception` | opt-in: one call only with `AGENT_PROFILE_BUILDER_LLM=1` (default `0`, section 6) | `yolo_output`, `image_quality`, `metadata` | `hazard_profile`, `perception_confidence`, `similar_cases` | `lookup_similar_cases` |
+| `research` | opt-in: one call only with `AGENT_RAG_RETRIEVER_LLM=1` (default `0`, section 6) | `hazard_profile`, `road_type` | `procedures`, `tool_result_ids`, `research_coverage` | `query_repair_standards` |
+| `decision` | panel (3 providers) or ReAct loop; production: single-provider ReAct against `ollama:qwen2.5:3b` | everything above, `reporter_intake`, `reporter_signals`, `evidence_round` | `action`, `rationale`, `priority`, `cited_sources`, `assessment`, `evidence_request` | 4 action tools (`check_hazard_severity`, `request_additional_evidence`, `create_draft_work_order`, `flag_for_urgent_review`) + `lookup_dataset_image` (read-only) + `recall_agent_notes` when `AGENT_WORKER_AUTONOMY=1`; `rank_similarity_to_catalog`, `check_recent_cluster` and `check_system_health` exist but are not offered (sections 4.8-4.10) |
+| `approval_gate` | no | verdict | `approvals` row, email | - |
+| `await_evidence` | no | new inputs from `update_state` | fresh budget (offset by the tokens already spent), `evidence_round += 1` | - |
+
+The Supervisor is Python, not an LLM. Before every worker it ticks the
+budget and checks four caps (`MAX_ITERATIONS=8`,
+`MAX_TOOL_HOPS_PER_AGENT=3`, `COST_CAP_USD=0.10`,
+`WALL_CLOCK_CAP_SECONDS=30`); a tripped cap ends the run with a
+legitimate `human_review` (`guard_fired=True`), never an error. The hop
+cap of 3 is not reachable in practice: Perception and Research make no
+tool hops, and the Decision ReAct loop stops at
+`DECISION_REACT_MAX_HOPS=2` first. `MAX_ITERATIONS` fires only through
+the supervisor visits; Decision always returns `final=True`, so the
+refine loop back to Perception is not reachable. The wall-clock budget
+starts when the run enters the graph (`sanitize_node` stamps the clock
+and publishes the deadline), not at process start; the app warms the RAG
+client and the compiled graph at startup. Until 31.10.2026 the clock
+started at the Supervisor's first check, one node later, so the signal
+extractor's calls ran with no deadline at all. The cost cap is
+computed from the `tokens_in` and `tokens_out` accumulated on the state
+(`BudgetTracker.sync_tokens` before every check), which includes the
+panel's threads. Every provider call is bounded by
+`min(AGENT_LLM_TIMEOUT_SECONDS, time remaining to the run's deadline)`
+(default 30; the VM runs 150 since 1.11.2026, because a 4,000-token
+Decision prompt takes 100-130 s on its CPU) with no SDK-level retries;
+retries belong to the backoff and the fallback chain, both stop at the
+deadline (`started_at + WALL_CLOCK_CAP_SECONDS`), a call that ran out of
+its timeout is not retried at all (the same prompt against the same host
+takes the same time; until 1.11.2026 the backoff repeated it up to four
+times), and the chain calls each distinct spec once. Inside an autonomous worker the
+bound is the tighter of the run deadline and the worker's
+`latency.worker_time_cap_s` (45 s until 1.11.2026, 90 s since: two worker calls on the CPU-only VM take 15 to 45 s each, and the record carries `time_used_s`, `time_cap_s`, `cut_by_cap`); no ReAct round, worker or Decision, starts
+with under 5 s of headroom, and a Decision stopped this way reports
+`fallback_reason=run_deadline`. A 429 that signals quota
+exhaustion (Gemini "Quota exceeded ... limit", Mistral code 1300) is not
+retried: the vendor is remembered as dead for `AGENT_LLM_DEAD_SECONDS`
+(default 300) and skipped.
+
+Least privilege is enforced by the tool maps in `roadguard_agent.py`:
+Perception sees only `lookup_similar_cases`, Research only
+`query_repair_standards`, Decision the remaining eight (4 action + 4
+read-only; sections 4.4-4.11).
+
+### 3.1 Intake output
+
+`reporter_intake` is
+`{ text, source: "llm" | "rules" | "none", summary, urgency_claimed, mentioned: { hazard_class, lane_blocked, road_type }, contradictions: [{ field, reporter, observed, detail }], suspicious }`.
+`source` is `none` when there is no text, `llm` when the LLM reply was
+on the contract, `rules` when the keyword pass answered.
+
+`reporter_signals` is
+`{ size_cm: int | null, depth_cm: int | null, vehicles_swerving: bool | null, standing_water: bool | null }`:
+the severity cues the reporter's text states (IDX 21). Rules:
+
+- `null` means the text does not say. The LLM extracts them
+  (`SIGNAL_EXTRACTOR_SYSTEM_PROMPT`, `reporter_signals` block); when the LLM is
+  off, fails, replies off the contract, or the text was flagged by the
+  sanitizer, a keyword pass fills them in degraded form: a number
+  followed by `cm` / `centimetres` is the size, or the depth when
+  `deep` / `depth` stands next to it; `swerv` sets `vehicles_swerving`;
+  `water` / `flooded` sets `standing_water`.
+- Values off the contract become `null`: a centimetre value must be a
+  positive number up to 10000 and is rounded to an integer; the two
+  flags must be real booleans.
+- They are evidence only. They never override `road_type`,
+  `lane_blocked` or the detector's class, never change the priority and
+  never set the action. They are stored on the state
+  (`reporter_signals`) and in the Intake trace entry
+  (`kind=reporter_text`, `content.reporter_signals`), and reach the
+  Decision prompt as `reporter_claims` (section 6).
+
+## 4. Tools
+
+Each tool declares a JSON schema for function calling and a plain
+Python callable. There is no dry-run switch: every tool writes its rows
+(and `flag_for_urgent_review` sends mail) whenever it runs. Evaluations
+isolate themselves with a temporary `ROADGUARD_DB_PATH` and
+`ROADGUARD_CHECKPOINT_PATH` (`scripts/agent_eval.py` does this by default).
+
+### 4.1 `check_hazard_severity` (Decision, pure)
+
+- Input: `{ hazard_class, confidence, road_type, lane_blocked, recurrence_count_30d }`.
+- Output: `{ priority: int in [0, 100], components: {...} }`.
+- Rules: base weight by class (D40 60, D20 40, D10 20, D00 15), a
+  confidence multiplier (0.5 below 0.5), road bonus (main 25,
+  secondary 15, bike_path 10, parking 5), lane bonus (full 20,
+  partial 10), recurrence bonus capped at 15, clamped to [0, 100].
+- Arguments the model leaves out are filled from the state the tool is
+  about (`hazard_profile.primary_class`, `primary_confidence`,
+  `metadata.road_type`, `lane_blocked`, `recurrence_count_30d`) and the
+  result names them in `args_from_state` (round 17, 1.11.2026: three
+  calls with `{}` failed validation in r10). A wrong value still fails;
+  a key that is on neither the arguments nor the state still fails, so a
+  verdict JSON sent as arguments scores nothing (round 10b).
+
+### 4.2 `lookup_similar_cases` (Perception, read-only)
+
+- Input: `{ location, hazard_class, window_days=30, k=5 }`
+  (`radius_meters` is accepted for the contract and ignored: there are
+  no coordinates).
+- Output: `{ count, cases[], is_recurring_location, note }`; `note` is
+  one of `prior_cases`, `no_prior_cases`, `lookup_failed`,
+  `location_too_coarse` (round 17: a `count=0` alone did not tell a
+  failed lookup from an empty history).
+- Source: the `hazards` table, same class, free-text location match
+  (`db.models.locations_match`: token containment, street-type words
+  dropped), last `window_days`, simulator rows and the hazard's own row
+  excluded on every path (the API stores the row before the graph runs;
+  in r10 the tool returned the case being triaged, `days_ago 0.0`, as a
+  prior case). A location without a digit or a street word is too coarse
+  to match (a bare city name never produces recurrence).
+  `is_recurring_location` is `count >= 3`.
+
+### 4.3 `query_repair_standards` (Research, read-only)
+
+- Input: `{ hazard_class, road_type, k=3 }`.
+- Output: `{ procedures[], tool_result_ids[], coverage }`.
+- Coverage: `direct_match` when a passage matches the hazard class and
+  the road type (or is tagged `any`) and, for a semantic hit, its text
+  supports this class at least as much as any other class (round 11:
+  `relevance.support` is `direct`, `weak` when another class's terms
+  dominate, `none` when the class is not named; `other_class_hits` and
+  `sentence_complete` are recorded, the summary the model reads is a
+  whole sentence up to 320 characters), `partial_match` when the passages
+  match the class only or support it weakly, `no_match` when nothing
+  comes back. Coverage is the topic axis; `decision_coverage.sufficiency`
+  (round 17) says whether the passages carry what a decision needs:
+  `sufficient_coverage` when they state a repair window and an urgency
+  or a safety risk, `insufficient_coverage` otherwise. Decision reads
+  both; with `insufficient_coverage` its payload says in words that the
+  standards found state no repair window or urgency, and a rationale that
+  states one anyway fails the fact-check (`repair_window_not_in_sources`).
+  ChromaDB is
+  queried for class and road type first, then for the class alone. A
+  Chroma query error yields `no_match`, not the in-code stub corpus.
+- Source: ChromaDB (`ROADGUARD_RAG_PATH`), seeded from
+  `data/mini_corpus.jsonl` until the real corpus lands. Every passage
+  goes through the quarantine extractor, which returns structured
+  fields plus `trimmed_summary`, the first 160 characters of the
+  passage verbatim; that JSON is all Decision sees. Known limitation
+  K1: the summary is not scrubbed (`sanitize_passage_for_quarantine` is
+  not called), so the SAFETY block in the prompt is the only guard on
+  those 160 characters.
+
+### 4.4 `request_additional_evidence` (Decision, writes)
+
+- Input: `{ hazard_id, missing_field: enum[second_angle, location, closer_shot, lighting, wider_shot], reason_shown_to_reporter (<= 140 chars) }`.
+- Output: `{ ok, request_id, missing_field, message_to_reporter, written_to_db }`.
+- Side effect: one `evidence_requests` row per (hazard, field).
+- The closed list of fields is the contract; the sentence the reporter
+  reads is phrased by the agent (section 7).
+
+### 4.5 `create_draft_work_order` (Decision, writes)
+
+- Input: `{ hazard_id, priority, suggested_action: enum[urgent, standard], cited_sources[] }`.
+- Output: `{ ok, draft_id, awaiting_human_approval: true, written_to_db }`.
+- Side effect: a `work_orders` row with `status='draft'`; the API links
+  it to the hazard once the hazard row exists.
+
+### 4.6 `flag_for_urgent_review` (Decision, writes)
+
+- Input: `{ hazard_id, reason, urgency: enum[immediate, today, this_week] }`.
+- Output: `{ ok, flag_id, approval_id, emailed }`.
+- Side effect: an `approvals` row with `action='human_review'` and an
+  internal email. The graph does not call it on the normal path (the
+  approval gate opens the single supervisor row); in ReAct mode a call
+  from the model is recorded, not executed.
+
+### 4.7 `lookup_dataset_image` (Decision, read-only)
+
+- Input: `{ sha256, phash }`.
+- Output: `{ hit, pic_id, class, country, bboxes, path }` on a hit, else
+  `{ hit: false }`.
+- Source: the 17,099-row RDD2022 catalogue
+  (`/opt/roadguard/data/dataset_catalog.sqlite`), exact match on sha256 OR
+  perceptual hash (hamming distance 0 only).
+- Side effect: on a hit the Decision agent short-circuits to the
+  `known_image` verdict and emits `fallback_reason=known_image_in_dataset`;
+  no LLM triage runs.
+
+### 4.8 `rank_similarity_to_catalog` (read-only; not offered to Decision since 1.11.2026)
+
+> The dispatcher answers this tool with a structured stub (no backend
+> yet). Offering it cost 738 characters of schema on every Decision call
+> and, in run r6 of 1.11.2026, a tool hop in two of the 17 slow passes, so
+> the schema stays out of the Decision offer until the backend exists; a
+> call the model still makes from memory gets the stub.
+
+- Input: `{ sha256, phash, k=3 }`.
+- Output: `{ matches: [{ pic_id, class, country, similarity_pct, phash_distance }] }`,
+  top-K catalogue rows sorted by ascending phash distance. `similarity_pct`
+  is `max(0, 100 - int(distance * 100 / 64))` (distance 0 is 100%, distance
+  24 is roughly 62%). Returns an empty list when the catalogue is absent.
+- Side effect: none. The agent uses the ranked near-matches to hedge
+  verdicts in prose ("this looks ~82% like catalogued D40 pic_id=1024") so
+  the operator sees a shade of grey instead of a binary known / new.
+
+### 4.9 `check_system_health` (read-only; no longer offered to Decision)
+
+> Since 31.10.2026 this tool is not in the Decision tool list: in the
+> 27.10 batch the model spent one of its two hops on it in six runs and
+> it never changed a verdict. The function still backs `GET /health/system`.
+
+- Input: `{}`.
+- Output: `{ ollama_running: bool, loaded_models: [{ name, size_gb, parameters }], host_memory_used_pct, stub_mode: bool }`.
+- Source: `ollama ps` via the local HTTP endpoint plus `/proc/meminfo`; stub
+  mode is on when `ROADGUARD_USE_LIVE=0` or when every provider in the
+  fallback chain is unreachable.
+- Side effect: none. The agent calls this when it sees signs of a degraded
+  pipeline (missing passages, unexpectedly thin RAG results, slow earlier
+  tool calls) so the assessment can name "pipeline is degraded (model X not
+  loaded, host memory 94%)" instead of fabricating certainty.
+
+### 4.10 `check_recent_cluster` (read-only; not offered to Decision since 1.11.2026)
+
+> Same status as 4.8: the dispatcher returns a stub, so the schema (919
+> characters) is not offered until the tool is wired to its backend.
+
+- Input: `{ location, hazard_class, window_hours=168 }`.
+- Output: `{ count, cluster_flag: enum[none, emerging, strong], recent_hazard_ids }`.
+- Source: SQLite `hazards` table, same class + token-containment location
+  match, within the window. `cluster_flag` is `none` for 0-2 reports,
+  `emerging` for 3-5, `strong` for 6+.
+- Side effect: none. The agent uses the flag to escalate recurring issues
+  that would otherwise triage as one-offs ("3 D40 reports on Weizmann
+  Street this week; cluster flag = emerging").
+
+### 4.11 Decision tool budget
+
+Decision calls at most `DECISION_REACT_MAX_HOPS=2` tools per ReAct run (the
+hop count is the same whether the agent calls an action tool or a
+read-only one). The read-only tools do not count against the one evidence
+request cap and do not create approvals or draft work orders. A failing
+tool call returns an error dict (`{ error, retriable }`); the agent may
+try a different tool but may not retry the same call.
+
+## 5. The four final actions
+
+| Action | Trigger (rule tree, in order) | Citations | Human in the loop |
+|---|---|---|---|
+| `known_image` | `lookup_dataset_image` hit on sha256 or exact phash AND the catalogued labels cover the detector's current top class | none | none; the dataset image already carries a verdict. On catalog-vs-detector contradiction (detector class not in catalog labels at confidence >= 0.30), the case is routed to `human_review` instead - see section 8. |
+| `human_review` | `perception_confidence == low` (blur, non-road scene, suspicious OCR, suspicious reporter text, scrubbed location); the reporter's description contradicts the detector's class; `research_coverage == no_match`; a budget cap; a grounding failure (the LLM is asked once); a second `needs_more_evidence` after the reporter's evidence; `jurisdiction_hint != "il"` on the signal extractor | none | `approvals` row, supervisor decides |
+| `needs_more_evidence` | the LLM asks for one more piece of evidence; the rule tree never triggers this on its own | none | reporter answers one request (section 7) |
+| `urgent` | D40 on a main road, lane partially or fully blocked | at least one id from `tool_result_ids` | `approvals` row, supervisor decides |
+| `standard` | everything else | at least one id from `tool_result_ids` | none; draft work order only |
+
+Note on confidence floors (24.10.2026): the historical `confidence < 0.5`
+floor to `human_review` and the zero-confidence floor to
+`needs_more_evidence` were removed. Measurement showed they routed ~60% of
+real submissions to human review regardless of other signals (bbox size,
+quality warnings, cluster flag, catalogue hit). The Decision persona now
+reads the detector confidence as one signal among many and decides; the
+`known_image` and the sanitiser-triggered `human_review` floors remain.
+
+Every verdict carries `action`, `rationale`, `priority` (the LLM's
+value clamped to 0-100 when the verdict comes from the LLM, the
+`check_hazard_severity` value on the rule path), `cited_sources` (ids
+from `tool_result_ids`, empty only for `needs_more_evidence` and
+`human_review`) and, when waiting, `evidence_request`.
+
+Every verdict also carries `assessment` (IDX 18, decided 23.10.2026):
+the Decision model's free text for the municipal supervisor, 2-3
+sentences on what the evidence shows, the risk and what to check on
+site. The node keeps one line of plain text, tags stripped, at most
+`ASSESSMENT_MAX_CHARS=400` characters. It is `""` on the rule tree, on
+the offline stub and when the budget guard fired (a guard verdict is
+not model text, so a resumed run never ships the earlier round's
+assessment with it); it is kept when a deterministic floor overrides
+the model's verdict. It is shown only on the supervisor surfaces, under
+the label "Agent assessment (model text, not a finding)": the approval
+page (`/approvals/{id}`), the approval email and the per-case page of
+the digest PDF, each only when non-empty. It is stored in
+`hazards.agent_assessment` (capped at 400 at the API) and is never part
+of a citizen-facing response (`HazardSubmitResponse`,
+`LiveHazardResponse`, the webapp card).
+
+### 5.1 severity vs priority vs action (25.10.2026)
+
+The reviewer flagged a case where `severity_signal=severe` landed on
+`action=standard` and asked for an explicit policy. Here it is.
+
+**severity_signal** (profile_builder, `_severity_from_signals`): a
+visual / geometric descriptor the profile builder attaches so the
+Decision model has a word for how bad the damage *looks*. It is NOT a
+policy input.
+
+| severity_signal | How profile_builder produces it |
+|---|---|
+| `severe` | D40 with lane_blocked in (partial, full); OR D40/D20 with `area_ratio >= 0.05` AND confidence >= 0.6 |
+| `moderate` | D40/D20 with confidence >= 0.5 (and not severe above); default when nothing else matches |
+| `minor` | D00 / D10 (linear cracks) |
+
+**priority** (`check_hazard_severity` tool): an integer 0-100 for queue
+ordering. Weights come from `policy.yaml`: class base (D40=60, D20=40,
+D10=20, D00=15), confidence multiplier, road_type bonus, lane_blocked
+bonus, recurrence bonus. priority is a NUMBER the supervisor sorts by;
+it does NOT by itself decide the action.
+
+**action** (the Decision rule tree + LLM): what the pipeline recommends.
+Decided from `primary_class`, `primary_confidence`, `road_type`,
+`lane_blocked`, `perception_confidence`, `research_coverage`,
+`intake_contradictions` and (on a catalogue hit) `dataset_match`.
+severity_signal is PRESENTED to the LLM as free-text context, but no
+deterministic rule maps a severity value to an action.
+
+**Why severity does not drive action.** severity_signal is a visual
+descriptor computed from the detector's bbox geometry alone. It cannot
+tell a severe-looking pothole in a parking bay (standard) from a
+severe-looking pothole on a highway with lane-blockage (urgent); the
+*same* severity_signal applies to both. Mapping severity directly to
+action would hide that difference. The rule tree's `urgent` precondition
+("D40 + main + lane_blocked in (partial, full) + confidence >= 0.6")
+already captures the "severe pothole in a dangerous context" case.
+
+**Example 1: D20 severe → standard is correct.** D20 alligator cracking
+on a main road, confidence 0.78, no lane blockage, RAG covered. The
+profile builder calls this `severe` because the bbox area is large;
+the rule tree correctly answers `standard` because D20 is not a
+pothole and the lane is not blocked.
+
+**Example 2: D40 severe → urgent is correct.** D40 pothole on a main
+road, confidence 0.82, lane_blocked=`partial`. severity=severe,
+action=urgent, priority ~77. Both agree.
+
+**Example 3: D40 severe → standard is also correct in some contexts.**
+D40 pothole on a secondary road, confidence 0.80, no lane blockage.
+severity=severe (geometry says it is), action=standard (the rule tree's
+urgent precondition needs lane blockage AND main road).
+
+In all three the LLM can argue a different verdict in prose if it has a
+grounded reason - a reporter who says vehicles are swerving, a cluster
+flag of 5+ reports at the same spot - and the rule tree only overrides
+when the LLM ignores the hard floors (low perception, no RAG coverage,
+intake contradiction, catalogue-vs-detector contradiction).
+
+### 5.2 Final-action table
+
+The LLM may deviate from the table within limits; the grounding
+assertion, the evidence cap and the deterministic floors will not. The
+LLM is asked once: a verdict that cites an id Research did not return,
+or that cannot be parsed, is discarded and the rule tree decides; since
+1.11.2026 (round 10) `fallback_reason` names the cause
+(`llm_reply_unparseable`, `llm_reply_ungrounded`, `llm_kept_calling_tools`,
+`llm_call_failed:<type>`, `run_deadline`) and the stored trace carries the
+model's reply excerpt under it; there is no second LLM call beyond the
+ReAct rounds. Deterministic floors override the LLM verdict: when the rule
+tree says `human_review` for a hard trigger (perception confidence
+`low` from suspicious OCR, suspicious reporter text, a non-road scene or
+insufficient image quality; an Intake class contradiction; coverage
+`no_match`), the shipped action is `human_review`, the trace carries
+`floor_applied=True` and `fallback_reason=deterministic_floor`, and the
+LLM rationale is kept in the trace as evidence. Upstream, Perception's
+LLM may only lower the rule-based confidence, never raise it, and
+Research keeps the tool's coverage when the LLM says `no_match` but
+passages were retrieved. The rule tree is also the eval baseline and
+the offline path.
+
+## 6. Decision LLM path
+
+Production (`AGENT_DECISION_REACT=1`, `AGENT_LLM_PROVIDER=ollama:qwen2.5:3b`):
+single-provider ReAct against a local Ollama model. The agent receives
+the eight tool schemas; every `tool_call` is executed, its result
+appended as a tool message, and the model called again, at most
+`DECISION_REACT_MAX_HOPS=2` executions counted on the budget tracker,
+the last call without tools. `hazard_id` always comes from state. A
+work order created in the loop is not created again; the evidence tool
+respects the cap; `flag_for_urgent_review` is recorded, not executed.
+ReAct replaces the panel for that hazard (decided 22.10.2026); the
+Decision model was `qwen2.5:7b` until 24.10.2026, swapped to `3b` after a
+3-5x latency win measured on this ARM host without a degradation on the
+scenario harness.
+
+Panel fallback (`AGENT_DECISION_REACT=0`): one call to the panel
+(`AGENT_LLM_PANEL`, three providers in parallel, majority vote with a
+severity tiebreak), each seat with exponential backoff and the
+`AGENT_LLM_FALLBACK` chain; tools are declared for knowledge only, the
+code calls them. Reference seats:
+`groq:openai/gpt-oss-120b,gemini:gemini-flash-lite-latest,mistral:mistral-small-latest`;
+chain:
+`gemini:gemini-flash-lite-latest,groq:openai/gpt-oss-20b,gemini:gemini-3.5-flash`.
+The panel votes with the seats that answered and falls back to the rule
+tree only when no seat answers. This path is kept for the benchmark
+harness and for the fallback when the Ollama container is unavailable;
+production runs the ReAct path.
+
+Decision prompt character (24.10.2026): the system prompt was rewritten
+to frame the LLM as a seasoned municipal road-safety inspector with
+explicit "take ownership and decide" guidance. The inspector:
+- names the hazard class and the location in prose;
+- uses the detector confidence as one signal; low confidence is not by
+  itself a reason to escalate to a human;
+- names exaggeration ("the reporter claims this is a sinkhole, but the
+  detector shows a 40 cm pothole and the bbox hugs the frame bottom");
+- names contradictions between fields ("the lane_blocked field says
+  `none` but the reporter's text says `can't pass`");
+- flags non-road images and non-Israeli submissions when the signals say
+  so;
+- writes 2-3 sentences of free-text rationale and a `uncertainty` field
+  that names what the inspector would want to check on site.
+
+Decision reply contract (both paths): one JSON object with `reasoning`,
+`action`, `rationale` (kept to 500 characters), `priority` (clamped to
+0-100), `cited_sources` (at most 5), `missing_evidence` (at most 5) and
+`assessment` (section 5). A reply without a valid `action` or with a
+non-list `cited_sources` / `missing_evidence` is unparseable and goes
+to the rule tree. The user message carries `hazard_profile`,
+`perception_confidence`, `metadata` (road type, lane, location),
+`research_coverage`, the first 3 `tool_result_ids` and `procedures`
+(quarantined summaries only, no URLs), `reporter_intake` (summary,
+contradictions, `urgency_claimed`, `suspicious`), `evidence_round`,
+`severity_check` (the executed `check_hazard_severity` for this
+submission, `already_run=true`), `dataset_match` as the confirmed lookup
+result when the photo is the same file as a catalogued one (sha256), or
+`similar_catalogue_photo` (pic_id, perceptual-hash distance, similarity
+percentage, that photo's labels and recorded prediction) when the match
+is only a look-alike, which the prompt tells the model is neither a
+known image nor a catalogue contradiction (round 10b: in r7 the model
+read such neighbours' labels as this photo's and escalated), and
+`rule_based_hint` (action,
+priority, the rationale cut to 240 characters, up to three cited
+sources, missing evidence). Since 1.11.2026 (round 10) the two read-only
+tools therefore cost no ReAct round; they stay in the offer, the tool
+schemas stay in the request on the final round as well (so the prompt
+prefix stays cached) and a one-line user message closes the tool budget
+before the final answer. Every tool call the model is offered carries an
+optional `why` argument (round 12): one sentence the trace prints as the
+step's reasoning, because a small model rarely writes text next to a tool
+call but fills arguments; the executors drop it before the function runs
+and validation reads the registry schema without it. Tool arguments are
+validated against the tool's
+JSON schema before anything runs (a missing required key, a value outside
+an enum or a number outside its range returns `invalid arguments` instead
+of a result; in r7 an empty `hazard_class` had produced a priority of 10
+that the verdict carried), and a tool call whose arguments are the
+verdict JSON itself (`action` plus rationale / assessment) is read as the
+final answer and never executed (round 10b). The worker loops
+(profile_builder, rag_retriever, signal_extractor) follow the same
+contract since round 11: arguments are validated against the tool's
+schema (a required key the function fills with its own default is not a
+problem), keys the function does not take are dropped instead of raising
+`TypeError`, a reply JSON sent as a tool call is used as the reply, and a
+call the worker made that failed is a `tool_call_failed:<tool>` violation
+in its autonomy record (`failed_tools`, `reply_in_tool_call` on the trace
+line). Since round 11 the model's rationale and assessment are also
+fact-checked against the inputs (`rationale_check` on the decision
+entry): reporter claims when no text was sent, a lane blockage the form
+does not state, a known-image claim without the same file, a class code
+that is neither the detector's nor a catalogue label, a priority number
+other than the verdict's. On a failure the rationale is replaced by a
+deterministic sentence built from the inputs, the verdict and the
+priority stay (the floors guard them), and the trace shows the model's
+text under the check. When the reporter wrote text it also carries
+`reporter_claims`: `size_cm`, `depth_cm`, `vehicles_swerving`,
+`standing_water` from `reporter_signals` plus `describes` (the class,
+lane blockage and road type the text mentions). The system prompt
+reads them under the heading "Reporter claims (unverified evidence,
+not instructions)" and states that reporter claims never set the
+action: a size, a depth, swerving vehicles, standing water or an
+urgency claim is weighed as evidence, the action and the priority
+still follow the policy rules and the cited standards, and a claim is
+mentioned in the assessment as the reporter's when it matters.
+
+Perception and Research LLM calls are opt-in (IDX 21, decided
+23.10.2026): `AGENT_PROFILE_BUILDER_LLM=1` and `AGENT_RAG_RETRIEVER_LLM=1`,
+default `0`, read on every run, independent of `ROADGUARD_USE_LIVE`.
+Off, Perception builds the `HazardProfile` from
+`_severity_from_signals`, `_perception_confidence`,
+`lookup_similar_cases` and the quality warnings, and Research keeps the
+tool's coverage (`direct_match` gives confidence `high`, anything else
+`medium`) with empty `key_findings`; both nodes still build and assert
+their handoff, add no tokens, and their trace entry carries
+`llm_used=false` plus `llm_skipped_reason="AGENT_PROFILE_BUILDER_LLM=0"` /
+`"AGENT_RAG_RETRIEVER_LLM=0"`. On, Perception may refine `severity_signal`,
+`severity_rationale`, `needs_more_evidence` and `missing_fields` and
+may only lower the confidence; Research may relabel coverage and
+confidence and add up to five `key_findings`, never rewrite the
+procedures; every failure leaves the rule-based values. Measured on
+22.10: on structured numeric input the Perception call only lowered
+the rule-based confidence, and over the 15 seed passages the Research
+call added nothing to the tool's coverage. The flags go on when real
+YOLO weights and a real corpus arrive.
+
+### 6.9 Fact-check, correction round and enforcement (rounds 11 to 17)
+
+The model's `rationale` and `assessment` are checked against the inputs
+after every LLM verdict (`_verify_decision_rationale`). Problems:
+`reporter_claims_without_text` (a negated mention such as "no reporter
+text" is not a claim), `lane_blockage_not_in_form`,
+`lane_free_claim_but_form_says_<x>`, `known_image_claim_without_sha256_match`,
+`catalogue_claim_without_match`, `class_not_in_inputs:<codes>`,
+`priority_text_<n>_vs_<m>`, and since round 17 `class_name_mismatch:<code>_<name>`
+("D20 pothole"), `class_name_not_in_inputs:<codes>`,
+`severity_text_minor_vs_profile_severe` / `severity_text_severe_vs_profile_minor`,
+`confidence_word_<word>_vs_<conf>_<band>` (the band comes from the policy's
+needs_more_evidence range: low below it, moderate inside it, high above;
+the same band travels to every agent as `detector_confidence_band` /
+`top1_confidence_band`, and the supervisor note is checked the same way),
+and `repair_window_not_in_sources`.
+
+On a failure the Decision gets one correction round (round 17): the
+conversation so far plus the problems in plain sentences, "decide again
+from the inputs only", the tool schemas kept for the prompt cache, no run
+when the deadline is near. A reply that passes is the verdict
+(`rationale_check.corrected=true`, the first verdict kept under
+`correction`). A reply that fails again, or none, keeps the text
+replacement of round 11 and is compared with the rule tree
+(`_enforce_unverified`): an action above the tree's (`urgent` over
+`standard`), or a priority more than 10 points above the tree's, means the
+rule tree's verdict with `fallback_reason=rationale_unverified` and the
+model's verdict in the trace (`enforcement=rule_tree_verdict`); otherwise
+the model's verdict stays (`enforcement=kept`), because the unsupported
+claim did not make it more severe. A priority of 0 from the model on a
+verdict other than `known_image` takes the executed severity check
+(`priority_from_severity_check`).
+
+## 7. Evidence round trip
+
+1. Decision returns `needs_more_evidence` and phrases the request with
+   one LLM call (`EVIDENCE_REQUEST_SYSTEM_PROMPT`): a field from the
+   closed list plus one sentence (<= 140 characters). Offline or on an
+   off-contract reply, the default sentence for the rule's field is
+   used. The `evidence_requests` row is written.
+2. The graph routes to `await_evidence`, compiled with
+   `interrupt_before`, so the run stops with its state checkpointed
+   (`SqliteSaver`, `thread_id == hazard_id`).
+3. `/hazards/submit` returns `status: "waiting_for_evidence"` with
+   `evidence_request: { id, hazard_id, missing_field, message }` and the
+   hazard row is stored with `status='waiting_for_evidence'`.
+4. `POST /evidence_requests/{id}/fulfill` takes the new upload in the
+   `HazardSubmit` shape from the hazard's owner (same JWT `sub`; anyone
+   else gets 404, and `GET /evidence_requests` lists only the caller's
+   own requests), injects the new inputs with `update_state`, resumes
+   the thread and marks the row fulfilled only after the resume
+   succeeds. `await_evidence` gives the run a fresh budget and
+   increments `evidence_round`; the run goes through sanitize and
+   intake again and, when the new upload is the same photo with the
+   same class, confidence, lane and road fields (round 10, 1.11.2026),
+   keeps the first pass's perception and research and goes straight to
+   decision (`evidence_reuse`; the trace names the kept workers); a new
+   photo or changed fields run perception and research again. The response is the
+   `/hazards/submit` shape with `status: "decided"`, and the hazard row
+   is overwritten with the final verdict.
+4b. Evidence integrity (round 17, 1.11.2026): a reply whose photo is the
+   original file (same sha256) with the same `road_type` and
+   `lane_blocked` and no new reporter text is not evidence; the API
+   answers 422 ("take another angle or add a note"), the request stays
+   pending and is not counted. The same file with a note means the
+   reporter has no other photo: `evidence_declined`, the resumed pass
+   keeps the workers and Decision routes to `human_review` without a
+   model call (`fallback_reason=evidence_declined`). The batch runner,
+   which has no second photo, answers that way.
+5. Cap: one request per hazard
+   (`policy.yaml decision.needs_more_evidence.max_requests_per_hazard`),
+   enforced in Decision and again at the API (a hazard that already has
+   a fulfilled request gets 404 on a second fulfil). A second
+   `needs_more_evidence` becomes `human_review`.
+6. Without a checkpoint (pruned after 7 days, dry run) the fulfill
+   still returns a verdict: a fresh run with `evidence_round=1`.
+7. The live path (`/hazards/live`) runs with `evidence_round=1` from the
+   start, so it never pauses.
+8. A pending request older than 7 days is expired by the daily digest
+   (`status='expired'`, hazard `status='evidence_expired'`).
+
+The webapp shows the request, switches the submit button to "Send the
+new photo" and posts the next upload to the fulfill endpoint.
+
+## 8. Policy fallbacks and input hardening
+
+Any of the following ends with `human_review`:
+
+- a budget cap trips (`fallback_reason=guard_fired`),
+- the Decision LLM is unavailable, unparseable or ungrounded (it is
+  asked once; the stored trace names the cause since round 10:
+  `llm_reply_unparseable`, `llm_reply_ungrounded`,
+  `llm_kept_calling_tools`, `llm_call_failed:<type>` or `run_deadline`)
+  and the rule tree itself cannot ground a verdict
+  (`fallback_reason=grounding_failed_after_1_retries`),
+- a deterministic floor overrides an LLM verdict on a hard trigger
+  (`fallback_reason=deterministic_floor`, `floor_applied=True` in the
+  trace),
+- the sanitizer flags OCR, location or reporter text,
+- the scene is not a road or the image is too blurred,
+- Research finds no matching procedure,
+- Intake records a class contradiction with the detector,
+- the signal extractor emits `jurisdiction_hint != "il"` (non-Israeli
+  submission routed to a human instead of into the normal urgent /
+  standard queue),
+- the reporter's evidence leaves the case ambiguous (cap).
+
+Any of the following ends with `known_image`:
+
+- `lookup_dataset_image` reports a sha256 or exact phash hit against the
+  catalogue **AND** the catalogued labels cover the detector's current
+  top class (or the detector reports nothing at confidence >= 0.30);
+  `fallback_reason=known_image_in_dataset`, no LLM triage runs and no
+  citizen-facing verdict is created.
+
+Catalog-vs-detector contradiction (25.10.2026): when
+`lookup_dataset_image` hits but the detector reports a class not in the
+catalogued labels at confidence >= 0.30, the case is routed to
+`human_review` with `priority=50` and a rationale that names the
+mismatch ("catalogued D20 but the current detector reports D40 at
+0.65"). The LLM is skipped in this path too - the mismatch is already
+determined by signals, there is nothing for the model to add. Earlier
+versions always answered `known_image` on a catalogue hit, which hid
+these contradictions behind a priority-0 verdict; that was a design
+bug and no longer the behaviour. Covered by three unit tests in
+`tests/test_known_image.py`.
+
+The deterministic paths that keep the system working without an LLM:
+the rule tree in every node (the default path of Perception and
+Research, section 6), keyword extraction in Intake, default evidence
+sentences, the rule-written patterns paragraph in the digest, and the
+rule tree as the eval baseline.
+
+Input hardening (24.10.2026): all free text (reporter description,
+location, OCR of in-image signage) runs through `sanitize_text` before
+any LLM sees it:
+
+1. Injection patterns are neutralised (lines of the form
+   `ignore previous instructions`, `you are now`, `system:`, control
+   codes, markdown fence tricks).
+2. The reporter text is wrapped in
+   `[USER_SUPPLIED_UNVERIFIED_BEGIN]...[USER_SUPPLIED_UNVERIFIED_END]`
+   markers so every downstream prompt reads it as evidence, not as
+   instructions.
+3. PII is redacted before the hazard row is stored or shown on an
+   operator page: Israeli phone numbers (`050-...`), email addresses,
+   Israeli national id numbers (9 digits with checksum), IBAN strings,
+   and credit-card-shaped sequences (13-19 digits with Luhn checksum).
+   Redaction replaces the match with `[redacted:phone]`, `[redacted:email]`,
+   etc. The raw text never reaches disk.
+4. `profile_builder` appends bbox-level sanity notes to
+   `quality_warnings` when a detection has tiny area (`< 0.2%` of the
+   frame), extreme aspect ratio (`> 10:1`), or hugs a frame edge; the
+   Decision prompt tells the LLM to downweight those detections.
+
+## 9. Evaluation protocol
+
+Scenarios live in `tests/multiagent_eval_scenarios.json`: 70 entries,
+50 baseline (ids `urg-*`, `std-*`, `evi-*`, `hum-*`) and 20 adversarial
+(`adv-*`: OCR injection, location injection, non-road scene, borderline
+confidence, combined vectors). The `kind` field is 20 simple / 30 mid /
+20 hard. Each entry:
+
+```json
+{
+  "id": "s001",
+  "kind": "simple",
+  "description": "clear pothole, full-lane block, main road, high confidence",
+  "yolo_output": { ... },
+  "image_quality": { ... },
+  "metadata": { ... },
+  "expected_action": "urgent"
+}
+```
+
+`tests/test_eval_scenarios.py` runs `run_graph` on every scenario with
+`ROADGUARD_USE_LIVE=0` and asserts `final.action == expected_action`.
+If `tests/labeled_scenarios.json` exists (scenarios from real images,
+same schema, Shai's deliverable; this is the only file name the harness
+reads) it is appended automatically, and a present file that does not
+load or does not match the schema fails the test loudly instead of
+being skipped. The deterministic stub never wins a verdict (it cites
+nothing), so this harness exercises the rule tree only: it proves
+topology, routing, sanitiser flags and the API/DB contracts, not LLM
+decision quality.
+
+The live path is measured by two scripts in the repository:
+
+- `scripts/agent_eval.py` runs `run_graph` over
+  `tests/labeled_scenarios.json` and `tests/multiagent_eval_scenarios.json`
+  under whatever `ROADGUARD_USE_LIVE` / `AGENT_*` environment is in force
+  (rule tree on a developer machine, the local Ollama models on the VM)
+  and reports accuracy, wall-clock P50 / P95 / max, per-agent LLM calls /
+  failures / fallbacks / fast-path skips, Decision tool calls, floors and
+  the confusion of expected vs. actual actions. It isolates itself in a
+  temporary database and checkpoint file by default (`--db` to point at a
+  copy of a real database; never the production file: there is no
+  dry-run switch, every run writes approval rows, work orders, evidence
+  requests and checkpoints).
+- `scripts/rag_relevance_eval.py` runs the 16 (hazard_class x road_type)
+  pairs through `query_repair_standards` and exits 1 when fewer than 95%
+  return a passage that names the class. On the production corpus
+  (31.10.2026): 16/16, every pair `direct_match`.
+
+Accuracy against the synthetic labels is agreement with the rule tree
+that seeded them, not ground truth; only the labelled file measures
+correctness.
+
+Thresholds (charter): correct-action rate >= 85%, groundedness >= 90%
+of `urgent` / `standard` verdicts citing an id from `tool_result_ids`.
+Current: 100/100 (73 synthetic + 27 labelled) and 100% offline (rule tree).
+
+## 9.5 LLM failure handling (25.10.2026)
+
+Every LLM call made through `chat()` is recorded in a per-node log with
+`ok` (True / False) and, on failure, `error_type` (the exception class
+name). When a node emits its handoff trace entry, `llm_summary(calls)`
+rolls those records up:
+
+```json
+{
+  "model": "ollama:qwen2.5:3b",
+  "calls": 2,
+  "ok_calls": 1,
+  "failed_calls": 1,
+  "latency_s": 42.13,
+  "tokens_in": 850,
+  "tokens_out": 220,
+  "errors": ["APIConnectionError"],
+  "mode": "live"
+}
+```
+
+When a node's LLM was enabled, every call failed, and the rule tree
+took over, the trace entry carries an explicit
+`llm_fallback_reason: "llm_calls_all_failed: APIConnectionError"` field.
+A supervisor reading the trace sees `llm_used=false` plus the reason
+instead of a silent fallback that looks indistinguishable from "LLM was
+off." Covered by `tests/test_llm_failure_handling.py`.
+
+### Budget-guard partial progress
+
+When the wall-clock cap fires mid-pipeline (profile_builder or
+rag_retriever is still running and Decision was not reached),
+`graceful_stop_decision(reason, state)` now enriches the rationale with
+whatever was accomplished:
+
+> "budget guard fired: WALL_CLOCK_CAP_SECONDS (240.0) reached. stopped
+> at rag_retriever. profile_builder got as far as class=D40
+> severity=severe perception=medium. rag_retriever got as far as
+> coverage=direct_match with 2 passage(s). decision was not reached;
+> manual triage recommended."
+
+The rationale is bounded to 500 characters (the hazards.agent_rationale
+column cap). The verdict stays `human_review` with `guard_fired=True`
+and `priority=50`, but the supervisor now has a usable partial picture
+instead of just "budget guard fired".
+
+## 10. Observability
+
+Every decision writes to the `hazards` row: `agent_decision`,
+`agent_rationale`, `priority`, `cited_sources_json`, `agent_trace_json`
+(ordered trace entries with `speaker`, `kind`, `content` for every node,
+both rounds when evidence was requested), `reporter_text` and `location`
+(the sanitised copies, never the raw text), `agent_assessment` (the
+Decision model's text for the supervisor, section 5), `status`
+(`open`, `waiting_for_evidence` or `evidence_expired`) and `work_order_id`. Supervisor
+decisions live in `approvals` (with the free-text `note`), reporter
+requests in `evidence_requests`. The twice-daily digest and the `rg-*`
+shortcuts read these tables, as do `GET /hazards/{id}` and
+`GET /hazards/history` (per user; fleet-wide on the private operator
+hosts, where /trace and /flow replay it).
+
+Every trace entry carries `ts`, set when the node creates it (round 17;
+until then most entries were stamped when the row was persisted, so
+`stage seconds` attributed the whole run to the last entries). The gap
+before an `await_evidence` entry is the reporter's time and is reported
+as `waiting_evidence`, apart from the nodes' compute; the DONE line reads
+`elapsed=<span>s (compute <c>s, waiting for evidence <w>s)` when a wait
+occurred. The MODEL line lists the detections behind the top one
+(`others=D40 0.46,D00 0.25`) and the PROFILE line the profile's secondary
+classes, so a verdict that mentions a secondary class can be checked
+against the inputs.

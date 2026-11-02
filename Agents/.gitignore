@@ -1,0 +1,127 @@
+# Byte-compiled / optimised Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.secret
+jwt.secret
+
+# Local SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+
+# RoadGuard runtime artefacts
+/var/
+roadguard.db
+
+# Large model weights (bootstrapped on first use, never committed)
+webapp/assets/models/*.ort
+# yolov8n-roadguard.onnx IS committed (public RDD2022-trained model,
+# dronefreak/rdd2022-yolov8n, ~12 MB). Keep the folder-level ignore for
+# other onnx experiments.
+webapp/assets/models/*.tmp.onnx
+webapp/assets/models/*.local.onnx
+/models/
+*.gguf
+
+# RDD2022 raw data (downloaded locally, never committed)
+data/rdd2022/
+data/raw/
+data/field_test_images/
+
+# Charter source (markdown version is committed)
+CHARTER_Smart_City_English.docx
+
+# Local planning notes
+PLAN.md
+PROMPT_HE.md
+
+# Logs
+*.log
+logs/
+
+# Node (webapp has no build step, but just in case)
+node_modules/
+sample_images/
+sample_images_real/
+
+# Office lock files
+~$*
+
+# Tunnel URL is needed by the webapp at runtime, so it stays tracked.
+# Keep the file lean: just {"origin": "..."}; no infra notes, no region, no provider.
+# webapp/tunnel-url.json  (intentionally NOT ignored)
+
+# Local assistant scratchpad (per-session config)
+/.*/
+!/.github/
+
+# VM-specific deployment scripts (reveal Oracle A1.Flex setup)
+deploy/
+
+# Team-internal meeting binaries (large, not needed for repo)
+docs/team-meeting/
+
+# artefacts that stay local: course materials, duplicate screenshots, third-party
+# sample images, corpus source documents, the processed dataset and index copies
+/AI AGENTS/
+/Pictures/
+/data/sample/*
+!/data/sample/firc_roadcrack_*
+/RAG/final_processed_dataset/
+/RAG/Data_for_Corpus-*/
+/RAG/_deploy/
+/RAG/4a2ed3ca-*/
+/RAG/*.zip
+/chroma_db-charter_grounded_corpus.zip
+/chromadb_dist/
+/rag_notebook/chroma_db/
