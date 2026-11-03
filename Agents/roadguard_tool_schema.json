@@ -1,0 +1,19 @@
+{
+    "type": "function",
+    "function": {
+        "name": "search_road_regulations",
+        "description": "Searches the official RoadGuard knowledge base for municipal traffic regulations, road maintenance standards, hazard thresholds, and safety guidelines. Use this tool whenever the user asks about rules, distances, thresholds, or policies related to road infrastructure.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The specific question or search query to run against the knowledge base in English or Hebrew."
+                }
+            },
+            "required": [
+                "query"
+            ]
+        }
+    }
+}
