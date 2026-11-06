@@ -32,16 +32,17 @@ export const CONFIG = Object.freeze({
   YOLO_CLASS_NAMES: ["D00", "D10", "D20", "D40"],
   // Model confidence threshold (default 0.35). The team's frozen
   // research threshold is 0.01, which pulls false positives into
-  // triage; 0.35 keeps the webapp aligned with the policy bands
-  // (0.6+ auto triage, 0.4-0.6 evidence, below 0.4 human review).
-  YOLO_CONFIDENCE_THRESHOLD: 0.35,
+  // triage; 0.25 (6.11.2026) lets weak detections reach the server
+  // with a class instead of "no detection"; the server's policy bands
+  // decide what happens next.
+  YOLO_CONFIDENCE_THRESHOLD: 0.25,
   // Non-maximum-suppression IoU threshold, per the team hand-off.
   YOLO_NMS_IOU: 0.7,
 
-  // Path to the tunnel JSON file. When present it holds the public API
-  // origin (a quick tunnel URL that changes whenever cloudflared restarts);
-  // when absent the webapp falls back to API_ORIGIN above.
-  TUNNEL_URL_JSON: "tunnel-url.json",
+  // Path to the tunnel JSON file. Holds the fixed named-tunnel hostname
+  // (see deploy/cloudflared.md); it is committed by hand once and only
+  // changes if the hostname changes.
+  TUNNEL_URL_JSON: "https://orarr2.github.io/RoadGuard/tunnel-url.json",
 
   // Local-dev defaults for the camera.
   CAMERA_DEFAULT_FACING_MODE: "environment",
