@@ -425,3 +425,80 @@ Run r10 (build e01c0de, Benny's corpus) was stopped at 25 of 94 on the owner's w
 
 Suite after round 17: 267 tests. Deployed for run r11 after the wipe.
 
+
+
+## 26. Round 18 (2.11.2026, morning): the owner's r11 review
+
+Run r11 (build 8c92552, Benny's corpus) finished 94 of 94 overnight (3 h 16 min; 40 standard, 29 known_image, 25 human_review, 0 needs_more_evidence; submit-to-verdict median 118 s, p90 185, max 316). The full trace went to the owner, who named six items. All six were built. His main concern was that the LLM still invents facts about the input: a reporter who writes "no other photo is available" became a D40 pothole with partial lane blockage and swerving vehicles; the profile builder raised severity to severe citing "partial lane blockage, area_ratio>=0.05, confidence>=0.6" on a case where lane was none, area was 0.02 and confidence was 0.54.
+
+| # | His finding | Change (round 18) | Test |
+|---|---|---|---|
+| A | signal extractor invented hazard class, lane and urgency from a "no new info" text | `_NO_NEW_INFO_RE` catches "no other photo", "nothing else to add" and the like (text goes through the keyword extractor, LLM is not called); `_verify_llm_claims` drops any mentioned field or urgency the keyword tables did not find; the trace entry carries `dropped_unsupported` and `skip_reason` | `tests/test_round18_integrity.py` |
+| B | profile builder raised severity on numeric claims the inputs did not back | `_SEVERITY_RANK` blocks any LLM upgrade (minor → severe clamped to minor); `_verify_perception_rationale` flags claims about `confidence>=X`, `area_ratio>=X` or lane blockage that the actual numbers do not back; the deterministic rationale wins and the autonomy record carries `severity_blocked_upgrade:*` and `rationale_claim:*` | same file; `tests/test_worker_autonomy.py` |
+| C | a tool-call-as-reply through a lookup tool was accepted as the agent's answer | `_worker_tool_call_is_other_tools_reply` fires only on tools whose names start with the lookup prefixes (`lookup_`, `query_`, `inspect_`, `extract_`, `check_`, `broaden_`, `recall_`); the call records `ok=False` with the error "arguments look like another tool's final answer" and the model is given one more round | same file; `tests/test_round11_reliability.py`; `tests/test_round16_labels.py` |
+| D | RAG passage previews lacked source metadata and the model called cases "urgent" when the standards did not | the Decision payload's `procedures` block carries `source: {url, date}` next to the article ids; the fact-check gains `urgency_not_in_sources`, matching the existing `repair_window_not_in_sources` logic | same file |
+| E | 43 of 94 r11 cases carried `fallback_reason=llm_unavailable_or_unparseable` on known_image, although Decision never called the LLM | the catalog-sealed branch sets `source=catalog_match` and leaves `fallback_reason` unset; the Decision line now reads `source=catalog_match` on the trace instead of a false fallback | same file |
+| F | on an evidence-declined pass the signal extractor still spent 90 s on a 0-token LLM call | the extractor now sets `skip_reason=evidence_declined` and skips the LLM entirely; the keyword extractor still runs for the deterministic path | same file |
+
+Suite after round 18: 295 tests.
+
+**Why the signal extractor LLM is NOT removed outright.** The owner's analysis of r11 asked for state integrity, not for the LLM's removal. Keeping it with strict verification (drop any claim the keyword tables cannot support) catches the invented fields the owner saw in r11 while leaving legitimate extractions (a text that does say "pothole on main road with partial blockage") untouched.
+
+
+## 27. Round 19 (3.11.2026, night): the owner's r12 review
+
+Run r12 (build 32a8a7c, Benny's 3,409-chunk corpus) finished 94 of 94 overnight (3 h 16 min; 36 standard, 32 known_image, 26 human_review, 0 needs_more_evidence; submit-to-verdict median 112 s, p90 166, max 328; 6-second improvement in the median over r11 and 19 in p90). The round 18 safeguards were present and visible: 43 catalog_match decisions (fallback label was wrong on 43 of 94 in r11 and is now source=catalog_match); 11 evidence_declined signal-extractor skips (~16 minutes saved); 9 severity_blocked_upgrade violations recorded; 18 correction rounds, one enforced to the rule tree. The owner then named six items from r12.
+
+Separately, Benny uploaded his second corpus on 3.11 morning: `english_vector_corpus_backup.json` 4,663 chunks (SHA256 c781b3d5bf807662381a0c0014fcca98334ca9d8bbb0b85d63fd5d941e1f0abe) plus `extracted_corpus_backup.json` 1,705 pre-chunk source entries, `Evaluation/groundedness_eval.py` + `benchmark_25_questions.json`, `SRC/rag_pipeline.py` and `Notebooks/01_roadguard_rag_pipeline_end_to_end.ipynb`. The 4,663-chunk corpus replaced the 3,409 one on the VM at 20:36 local; direct chroma queries confirm the four D classes return relevant content.
+
+| # | His finding | Change (round 19) | Test |
+|---|---|---|---|
+| A | r12 hz_472b131e8248: a phash neighbour pic_id=10179 cited as "cataloged D00 crack is consistent" | `_PIC_ID_CITATION_RE` + a new fact-check `phash_neighbor_cited_as_evidence:pic_id=<n>` fires when the model's text names a pic_id and the match is NOT sha256; the Decision payload's `similar_catalogue_photo.note` strengthens the rule in words ("its pic_id MUST NOT be cited as evidence about this photo's class or verdict") | `tests/test_round19_integrity.py`; `tests/test_round19_regression.py` |
+| B | the Validator flagged but did not clean (hz_ace919c8055a: STANDARD stayed with the model's unsupported `reporter_claims`) | `_removed_claims_note` names the kinds of claim removed from the model's text; the final `decision["rationale"]` and `decision["assessment"]` carry both the deterministic sentence and the note, so the operator reads what was dropped and why | same file |
+| C | `direct_match` wording read as "the standards answer the operational questions" | the RAG trace line now reads `topic=<direct_match> sufficient=<yes\|no>  answers=... missing=...`; the `coverage` state key is unchanged (back-compat), the trace just surfaces both axes | same file; `tests/test_round16_labels.py` |
+| D | Benny's corpus only populates `source` (document filename), not `source_url`, `issuing_body`, `date` | the Decision payload's `procedures[*].source` dict now carries `name: <filename>` next to `url` and `date`; the operator sees the document name even when url/date are empty | same file |
+| E | 3 of 94 r12 cases wrote "sec-4.3" in the rationale, which is the fewshot example citation copied as a real id | both `_RESEARCH_FEWSHOT` and `_DECISION_FEWSHOT` use `ex-id-00` as the example id; a note under each example says "cite only tool_result_ids from THIS case". The grounding check already rejected `sec-4.3` out of context, this prevents the copy | same file |
+| F | regression tests for the five scenarios from the owner's review | `tests/test_round19_regression.py`: profiler cannot claim confidence above actual; LLM severity upgrade blocked; phash neighbour pic_id citation flagged; sha256 identity with contradicting label routed to human_review; `insufficient_coverage` blocks repair-window and urgency claims | `tests/test_round19_regression.py` |
+
+Suite after round 19: 309 tests.
+
+
+## 28. Round 20 (3.11.2026, night): the owner's r13 review
+
+Run r13 (build 3317422, Benny's new 4,663-chunk corpus) was stopped at 16 of 94 on the owner's word after he read the live trace and named four items. His main concern: phash neighbour labels and pic_id were still in the Decision prompt, so the model could cite them even when it had no sha256 identity; and the Supervisor tool failed on every call because the payload used `hazard_class_detected` while the tool required `hazard_class`.
+
+| # | His finding | Change (round 20) | Test |
+|---|---|---|---|
+| A | the Decision prompt still contained the phash neighbour's labels, pic_id and recorded prediction, so the model could copy them as evidence (r13 hz_8d9a063b403e: live D20 but the neighbour was D40 and the verdict stayed STANDARD) | `_catalogue_context_for_prompt` on a phash match now delivers ONLY a `note` block; pic_id, phash_distance, its_labels, its_recorded_prediction and similarity_pct are hidden. The LLM cannot cite what it does not see. The rule tree and the trace still see the full match. | `tests/test_round20_integrity.py`; `tests/test_round10b_live_fixes.py` |
+| B | the Supervisor tool failed every call because the payload used `hazard_class_detected` and the tool required `hazard_class` (r13 hz_0973521216da: `invalid arguments: hazard_class is required`, then the supervisor read "no action needed, hazard class not provided") | the payload now carries both `hazard_class` (for the tool) and `hazard_class_detected` (back-compat with the note check) | same file |
+| C | a claim the fact-check removed from the model's rationale could still reach a downstream agent through the `state` | `_scrub_state_on_fact_check_failure` clears `reporter_intake.mentioned`, `reporter_intake.urgency_claimed` and `reporter_signals` on `reporter_claims_without_text`; clears `reporter_intake.mentioned.lane_blocked` on `lane_blockage_not_in_form`. The rationale_check carries `state_scrubbed` so the operator sees which fields were cleared. | same file |
+| D | autonomy metrics mixed `agent_called=X` and `agent_called=none  auto_ran=X`, which looked like autonomy even when it was a deterministic fallback | the autonomy line always carries `source=` - `agent_choice` when the hop count is positive and the agent chose a tool, `deterministic_fallback` when only `auto_ran` ran, or an explicit source the caller set (e.g. `agent_retrieval` on the RAG path) | same file; `tests/test_round16_labels.py`; `tests/test_worker_autonomy.py` |
+
+Suite after round 20: 318 tests.
+
+**Why the phash neighbour is not just annotated.** Round 19 added a fact-check that flagged a pic_id citation in the model's text, with a strong note in the payload that the pic_id "MUST NOT be cited". In r13 the model still cited it. Hiding the identifying details is the only way to be sure the model cannot copy them: without a pic_id in the prompt, there is no pic_id to copy.
+
+
+## 29. Round 21 (3.11.2026, late night): the owner's r13 review, enforcement edition
+
+Run r14 (build 88c83ef, round 20 code) was stopped at 21 of 94 so the fixes
+the owner named could land before the next full run. His read of r13 and
+r14 was not that the system failed to DETECT mistakes, but that it still let
+them AFFECT the final verdict and the operator-facing trace.
+
+| # | His finding | Change (round 21) | Test |
+|---|---|---|---|
+| A | r13 hz_770ac7c30461 (live D20, phash neighbour D40): verdict STANDARD; hz_995e3102af69 (live D40, phash D20): STANDARD. The hidden-payload fix of round 20 removed the labels from the model's view, but the rule tree still let STANDARD through | `_decide_rule_based` gains a floor: a phash match whose catalogue classes do not include the live detector's class is routed to `human_review` with `floor_reason=phash_class_mismatch`, regardless of the LLM path. The catalogue pic_id is cited, the rationale names the disagreement | `tests/test_round21_integrity.py` |
+| B | the operator trace printed `model rationale: ...` and `model assessment: ...` under the FAIL line; the owner saw this as "the system shows the user the text it decided to discard" | the formatter prints only the deterministic sentence and one tail saying "model text kept on rationale_check for the audit"; the rejected text stays in the stored `rationale_check.model_rationale` / `.model_assessment` for the auditor, out of the operator's view | same file; `tests/test_round11_reliability.py` |
+| C | profiles downgraded severity because "no past reports" or "small area_ratio" alone; the owner's rule is that a downgrade needs a positive indicator of low severity | `_llm_refine` blocks any downgrade whose rationale does not name a positive low-severity signal (small cm value, "surface crack", "no spalling", "healed", etc.); the autonomy record carries `severity_blocked_downgrade:X_to_Y` | same file; `tests/test_round18_integrity.py` |
+| D | the operator did not see in words what the retrieved standards failed to answer | `_deterministic_rationale` on insufficient_coverage appends "standards did not answer: <missing>" so the sentence shown to the operator always carries that fact | same file |
+
+Suite after round 21: 326 tests.
+
+**Why the phash floor lives in the rule tree.** Round 20 hid the phash
+neighbour's labels from the Decision prompt; the model cannot cite what it
+cannot see. But the Decision model is only one of two paths: the rule tree
+runs in parallel and makes the final verdict when the model fails
+grounding or is skipped. In r13 the rule tree happily picked STANDARD on
+a phash neighbour with a contradictory label. Round 21 closes that gap at
+the tree level, so both paths route to human_review.

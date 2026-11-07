@@ -20,14 +20,13 @@ for the team's deliverables at these paths next to it (first match wins):
 | Dependency | Paths tried, in order | Owner |
 |------------|-----------------------|-------|
 | YOLOv8n ONNX detector | `../models/`, `../Models/`, `../webapp/assets/models/yolov8n-roadguard.onnx` (the last one is where this repository keeps it) | Shai |
-| Sample road images | `../data/sample/` | Or (50 catalogue images from Shai's dataset) |
-| ChromaDB corpus `charter_grounded_corpus` | `../rag/chroma_db/`, `../RAG/chroma_db/`, `../Rag/chroma_db/`, `../rag_notebook/chroma_db/`, `../RAG/_deploy/` | Benny |
+| Sample road images | `../data/sample/` | Ovad |
+| ChromaDB corpus `charter_grounded_corpus` | `../rag/chroma_db/`, `../RAG/chroma_db/`, `../Rag/chroma_db/`, `../rag_notebook/chroma_db/` | Benny |
 
 The corpus is the one exception to "nothing is downloaded": when none of
 the ChromaDB directories exists, the download cell fetches the corpus
 archive (about 16 MB) from the GitHub release asset named in the notebook
-and extracts it to `../rag/chroma_db/` (the 26.10 build, 2,433 passages;
-production runs Benny's 31.10 corpus with 3,409 passages). The detector and the sample images
+and extracts it to `../rag/chroma_db/`. The detector and the sample images
 raise a clear `FileNotFoundError` naming the expected path when missing.
 
 ```

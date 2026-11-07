@@ -226,15 +226,19 @@ async function banner() {
 }
 
 async function replayHistory() {
-  // On first open, print the trace of every recent hazard oldest-first,
-  // then let the live tick() keep following new ones. Without this the
-  // page shows a greeting + empty terminal when nothing new is being
-  // submitted RIGHT NOW, which hides the whole last batch run.
+  // On first open, print the traces of the recent hazards newest first:
+  // the last 24 hours, at most 20 cases (round 29, audit F15: the old
+  // oldest-first replay of 200 cases showed the previous batch and none
+  // of today's), then let the live tick() keep following new ones.
   try {
-    const h = await get("/hazards/history?limit=200");
-    const items = (h.items || []).slice().reverse();  // oldest first
-    if (!items.length) return;
-    print("--- replaying " + items.length + " recent hazard(s) ---", "hdr");
+    const h = await get("/hazards/history?limit=20");
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    const items = (h.items || []).filter(it => {
+      const t = Date.parse(it.reported_at || "");
+      return !Number.isFinite(t) || t >= cutoff;
+    });
+    if (!items.length) { print("--- no hazards in the last 24 hours; following live ---", "hdr"); return; }
+    print("--- replaying " + items.length + " hazard(s) from the last 24 hours, newest first ---", "hdr");
     // Count the ones we actually render vs the ones with empty / failing
     // traces so the header never claims more than the operator sees.
     let rendered = 0, emptyTrace = 0, failed = 0;
@@ -260,7 +264,7 @@ async function replayHistory() {
     }
     // Mark the newest as "already seen" so the live tick does not
     // reprint it. tick() uses `current` + `printed` to resume.
-    const newest = items[items.length - 1];
+    const newest = items[0];
     current = newest.hazard_id;
     try {
       const rep = await get("/report/" + encodeURIComponent(current));
@@ -451,8 +455,9 @@ async function tick() {
   if (!token) return;
   try {
     const d = await fetchJson("/report", token);
+    const win = d.window_hours ? ' (last ' + d.window_hours + 'h)' : '';
     el("counts").innerHTML =
-      '<span><b>Total:</b> ' + (d.total_hazards ?? 0) + '</span>' +
+      '<span><b>Total' + win + ':</b> ' + (d.total_hazards ?? 0) + '</span>' +
       '<span><b>Urgent:</b> ' + (d.by_action?.urgent ?? 0) + '</span>' +
       '<span><b>Standard:</b> ' + (d.by_action?.standard ?? 0) + '</span>' +
       '<span><b>Needs evidence:</b> ' + (d.by_action?.needs_more_evidence ?? 0) + '</span>' +
@@ -564,17 +569,32 @@ button {
 }
 button:hover { background: var(--brand-1); color: #ffffff; border-color: var(--brand-1); }
 button:active { transform: scale(0.97); }
+/* Round 23 (4.11.2026) layout fix: the flow diagram spans the row, and
+   the four side panels (Current hazard + KPI + Run cost + Agent
+   advantage) sit side-by-side in a single row BELOW it, so the operator
+   does not scroll a three-section sidebar on every visit. Collapses to
+   two columns on tablets and one on phones. */
 main {
   display: grid;
-  grid-template-columns: 1fr 340px;
+  grid-template-columns: 1fr;
   gap: 14px;
   padding: 14px;
   max-width: 1600px;
   margin: 0 auto;
 }
-@media (max-width: 900px) {
-  main { grid-template-columns: 1fr; }
+aside {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
 }
+@media (max-width: 1100px) {
+  aside { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  aside { grid-template-columns: 1fr; }
+}
+aside .panel { margin-top: 0 !important; }
 .flow-container {
   background: var(--card);
   border: 1px solid var(--border);
@@ -863,8 +883,37 @@ footer {
       </div>
       <div class="live-line" id="live-line">waiting for events...</div>
     </div>
+    <!-- Round 23 (4.11.2026): live KPI vs targets, per-agent justified
+         ratios, run cost totals, advantage-over-tree case ids. Polled
+         from /stats/kpi, /stats/agents and /stats/advantage every 30s.
+         Each row carries a short inline note the owner can read without
+         opening the trace. -->
+    <div class="panel" id="kpi-panel" style="margin-top:14px">
+      <h2>KPI vs targets (24h)</h2>
+      <div id="kpi-rows" class="kpi-rows">loading...</div>
+    </div>
+    <div class="panel" id="cost-panel" style="margin-top:14px">
+      <h2>Run cost (24h)</h2>
+      <div id="cost-rows" class="kv">loading...</div>
+    </div>
+    <div class="panel" id="advantage-panel" style="margin-top:14px">
+      <h2>Agent advantage (24h)</h2>
+      <div id="advantage-rows" class="kv">loading...</div>
+    </div>
   </aside>
 </main>
+<style>
+  .kpi-rows .kpi-row { display:flex; justify-content:space-between; gap:8px; align-items:center;
+                       padding:6px 0; border-bottom:1px solid var(--border); font-size:13px; }
+  .kpi-rows .kpi-row:last-child { border-bottom:none; }
+  .kpi-rows .kpi-label { color: var(--text); font-weight: 600; }
+  .kpi-rows .kpi-value { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; font-size: 13px; }
+  .kpi-rows .kpi-value.ok { color: var(--ok); }
+  .kpi-rows .kpi-value.fail { color: var(--bad); }
+  .kpi-rows .kpi-note { font-size: 11px; color: var(--dim); padding-top:2px; }
+  #advantage-rows .adv-case { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace;
+                              font-size: 11px; color: var(--text-mid); word-break: break-all; }
+</style>
 
 
 <!-- The passphrase modal was removed. /flow is reached through the Caddy
@@ -1303,6 +1352,96 @@ function start() {
 function stop() {
   if (timer) { clearInterval(timer); timer = null; }
 }
+
+// Round 23 (4.11.2026): KPI / cost / advantage panels. These three poll
+// their own endpoints every 30 seconds; the diagram's 2-second tick
+// focuses on the running hazard and does not need to be slowed down.
+let kpiTimer = null;
+async function refreshKpi() {
+  try {
+    const d = await apiGet("/stats/kpi?window_hours=24");
+    const rows = el("kpi-rows");
+    if (!rows) return;
+    rows.innerHTML = "";
+    for (const k of (d.kpis || [])) {
+      const row = create("div", "kpi-row");
+      row.appendChild(create("div", "kpi-label", k.label));
+      const vcls = "kpi-value " + (k.status === "ok" ? "ok" : "fail");
+      const vtext = (k.key === "median_latency_s")
+        ? (k.value_pct + " s / cap 360 s")
+        : (k.value_pct + "% / target " + k.target_pct + "%");
+      row.appendChild(create("div", vcls, vtext));
+      rows.appendChild(row);
+      if (k.note) {
+        const note = create("div", "kpi-note", k.note);
+        note.style.gridColumn = "1 / -1";
+        rows.appendChild(note);
+      }
+    }
+    if (!(d.kpis || []).length) rows.textContent = "no cases in the last 24h";
+  } catch (e) { /* silent, retry next tick */ }
+}
+async function refreshCost() {
+  try {
+    const d = await apiGet("/stats/agents?window_hours=24");
+    const rows = el("cost-rows");
+    if (!rows) return;
+    const c = d.cost_total || {};
+    const aj = d.agents_justified || {};
+    rows.innerHTML = "";
+    function row(k, v) {
+      rows.appendChild(create("span", "k", k));
+      rows.appendChild(create("span", "v", v));
+    }
+    row("total hazards", String(d.total_hazards || 0));
+    row("LLM calls", String(c.llm_calls || 0));
+    row("tokens in", String(c.tokens_in || 0));
+    row("tokens out", String(c.tokens_out || 0));
+    row("wall seconds", String(c.wall_seconds || 0));
+    row("Ollama self-hosted", "$0.00");
+    row("commercial equivalent", "$" + Number(c.cost_commercial_equivalent_usd || 0).toFixed(4));
+    rows.appendChild(create("div", "kpi-note", "monthly city cost: Oracle A1.Flex free + Ollama + Tailscale = $0"));
+    const header = create("div", "kpi-note", "agent justified / runs:");
+    header.style.marginTop = "6px";
+    rows.appendChild(header);
+    for (const sp of ["sanitize","signal_extractor","supervisor","profile_builder","rag_retriever","decision"]) {
+      const b = aj[sp] || {};
+      row(sp, (b.justified || 0) + " / " + (b.runs || 0));
+    }
+  } catch (e) { /* silent */ }
+}
+async function refreshAdvantage() {
+  try {
+    const d = await apiGet("/stats/advantage?window_hours=24");
+    const rows = el("advantage-rows");
+    if (!rows) return;
+    rows.innerHTML = "";
+    const over = d.advantage_over_tree || [];
+    const approved = d.agent_approved_by_human || [];
+    const denied = d.agent_corrected_by_human || [];
+    function section(title, list) {
+      const h = create("div", "kpi-note", title + " (" + list.length + ")");
+      h.style.marginTop = "6px"; h.style.fontWeight = "600";
+      rows.appendChild(h);
+      if (!list.length) { rows.appendChild(create("div", "adv-case", "none")); return; }
+      for (const c of list.slice(0, 5)) {
+        const line = create("div", "adv-case",
+          (c.id || "").substring(0, 12) + "  " + (c.class || "") + "  " + (c.decision || c.final_action || ""));
+        rows.appendChild(line);
+      }
+      if (list.length > 5) rows.appendChild(create("div", "adv-case", "... and " + (list.length - 5) + " more"));
+    }
+    section("Agent > rule tree", over);
+    section("Agent approved by human", approved);
+    section("Agent corrected by human", denied);
+  } catch (e) { /* silent */ }
+}
+function startKpiPolls() {
+  if (kpiTimer) clearInterval(kpiTimer);
+  refreshKpi(); refreshCost(); refreshAdvantage();
+  kpiTimer = setInterval(() => { refreshKpi(); refreshCost(); refreshAdvantage(); }, 30000);
+}
+startKpiPolls();
 
 el("pause-btn").addEventListener("click", () => {
   paused = !paused;
@@ -1913,6 +2052,17 @@ def _route_to_human(db: Database, hazard: Any, kind: str, reason: str) -> None:
     )
 
 
+def _trace_has_event(trace: list | None, kind: str) -> bool:
+    """True when a pipeline event of this kind is on the stored trace.
+    Round 29 (6.11.2026 audit F3): a run the service restart killed is
+    shown as such to the citizen and in the digest, not as an ordinary
+    supervisor review with no analysis behind it."""
+    return any(
+        isinstance(e, dict) and e.get("speaker") == "pipeline" and e.get("kind") == kind
+        for e in (trace or [])
+    )
+
+
 def recover_interrupted_runs(db_path: str) -> int:
     """Startup only. A row still 'queued' or 'processing' when the service
     starts belonged to a background task that died with the old process;
@@ -2223,6 +2373,29 @@ def _aggregate_agent_metrics(rows) -> dict[str, Any]:
     fallback_by_agent: dict[str, dict[str, int]] = {}
     fast_path_skips: dict[str, int] = {}
     autonomy: dict[str, dict[str, int]] = {}
+    # Round 22 (4.11.2026): per-run agent value counters. Each hazard
+    # contributes at most one increment to each bucket here, built from
+    # the same Decision final entry that _build_agent_value_summary reads
+    # (worker_impact + rationale_check + floor). Rates are computed
+    # client-side against total_hazards, exactly like the other blocks.
+    agent_value = {
+        "runs": 0,                           # hazards with a Decision final
+        "has_worker_impact": 0,              # at least one worker baseline was captured
+        "changed_rule_hint": 0,              # worker LLMs moved the tree's verdict
+        "profile_llm_changed": 0,            # Profile Builder's LLM moved the tree
+        "research_llm_changed": 0,           # RAG's LLM moved the tree
+        "decision_llm_react": 0,             # Decision used ReAct (count by source tag)
+        "decision_rule_based": 0,            # Decision ran rule_based only
+        "decision_catalog_match": 0,         # sha256 catalogue match short-circuit
+        "floor_applied": 0,                  # a deterministic floor fired
+        "enforcement_rule_tree_verdict": 0,  # Decision LLM overridden (too severe)
+        "enforcement_kept": 0,               # LLM verdict kept over the fact-check
+        "rule_tree_eq_final": 0,             # the rule tree already matched the final
+        "llm_more_severe_than_tree": 0,      # LLM proposed > tree (regardless of enforcement)
+        "llm_less_severe_than_tree": 0,      # LLM proposed < tree (floors tend to win)
+    }
+    _SEV_RANK = {"standard": 1, "known_image": 1, "needs_more_evidence": 2,
+                 "human_review": 3, "urgent": 4}
     for row in rows or []:
         try:
             trace = json.loads((row["agent_trace_json"] if hasattr(row, "__getitem__") else getattr(row, "agent_trace_json", None)) or "[]")
@@ -2289,6 +2462,52 @@ def _aggregate_agent_metrics(rows) -> dict[str, Any]:
                     counters["decision"]["grounding_failed"] += 1
                 if c.get("floor_applied"):
                     counters["decision"]["contradiction_floor"] += 1
+                # Round 22 (4.11.2026): agent value aggregate - per-case
+                # flags pulled from the same Decision final entry.
+                agent_value["runs"] += 1
+                source = str(c.get("source") or "")
+                if source == "llm_react":
+                    agent_value["decision_llm_react"] += 1
+                elif source == "rule_based":
+                    agent_value["decision_rule_based"] += 1
+                elif source == "catalog_match":
+                    agent_value["decision_catalog_match"] += 1
+                wi = c.get("worker_impact")
+                final_action = action
+                rt_action = final_action
+                if isinstance(wi, dict):
+                    agent_value["has_worker_impact"] += 1
+                    if wi.get("changed_rule_hint"):
+                        agent_value["changed_rule_hint"] += 1
+                    if wi.get("profile_llm_changed"):
+                        agent_value["profile_llm_changed"] += 1
+                    if wi.get("research_llm_changed"):
+                        agent_value["research_llm_changed"] += 1
+                    rt_action = str(wi.get("rule_hint_without_worker_llm") or final_action)
+                if rt_action == final_action:
+                    agent_value["rule_tree_eq_final"] += 1
+                ov = c.get("overridden_llm_verdict")
+                llm_action = None
+                if isinstance(ov, dict) and ov.get("action"):
+                    llm_action = str(ov.get("action") or "")
+                elif source == "llm_react":
+                    llm_action = final_action
+                if llm_action:
+                    rt_rank = _SEV_RANK.get(rt_action, 1)
+                    llm_rank = _SEV_RANK.get(llm_action, 1)
+                    if llm_rank > rt_rank:
+                        agent_value["llm_more_severe_than_tree"] += 1
+                    elif llm_rank < rt_rank:
+                        agent_value["llm_less_severe_than_tree"] += 1
+                if c.get("floor_applied"):
+                    agent_value["floor_applied"] += 1
+                rc = c.get("rationale_check")
+                if isinstance(rc, dict):
+                    enf = str(rc.get("enforcement") or "")
+                    if enf == "rule_tree_verdict":
+                        agent_value["enforcement_rule_tree_verdict"] += 1
+                    elif enf == "kept":
+                        agent_value["enforcement_kept"] += 1
             llm_s = c.get("llm") or {}
             if isinstance(llm_s, dict) and llm_s.get("failed_calls", 0) > 0:
                 had_fallback = True
@@ -2331,6 +2550,77 @@ def _aggregate_agent_metrics(rows) -> dict[str, Any]:
                 a["tool_failures"] += len(auto.get("failed_tools") or [])
         if had_fallback:
             llm_fallback_runs += 1
+    # Round 23 (4.11.2026): per-agent justified aggregate + total cost +
+    # advantage over rule tree. Advantage over the human lives on /stats/
+    # advantage and reads the approvals table (human decisions on hazards
+    # the agent flagged for review); it is not in this trace walk.
+    justified_counts = {sp: 0 for sp in (
+        "sanitize", "signal_extractor", "supervisor",
+        "profile_builder", "rag_retriever", "decision")}
+    justified_runs = {sp: 0 for sp in justified_counts}
+    cost_total = {"llm_calls": 0, "tokens_in": 0, "tokens_out": 0,
+                  "wall_seconds": 0.0, "cost_self_hosted_usd": 0.0,
+                  "cost_commercial_equivalent_usd": 0.0}
+    advantage_over_tree_ids: list[str] = []
+    for row in rows or []:
+        # Round 23 (4.11.2026): a test-fixture row (or a hazards row from a
+        # DB that has not run the agent_value_json migration yet) may lack
+        # this column entirely; fall back to building the summary from the
+        # trace, so the aggregate stays correct and never raises KeyError.
+        raw = ""
+        try:
+            keys = row.keys() if hasattr(row, "keys") else []
+            if "agent_value_json" in keys:
+                raw = row["agent_value_json"] or ""
+        except Exception:
+            raw = ""
+        if not raw:
+            try:
+                tj = row["agent_trace_json"] if "agent_trace_json" in (row.keys() if hasattr(row, "keys") else []) else "[]"
+            except Exception:
+                tj = "[]"
+            try:
+                from roadguard_agent import _build_agent_value_summary_json
+                raw = _build_agent_value_summary_json(tj or "[]") or ""
+            except Exception:
+                raw = ""
+        try:
+            av = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(av, dict):
+            continue
+        pa = av.get("per_agent_justified") or {}
+        for sp, data in pa.items():
+            if not isinstance(data, dict):
+                continue
+            if data.get("ran"):
+                justified_runs[sp] = justified_runs.get(sp, 0) + 1
+            if data.get("justified"):
+                justified_counts[sp] = justified_counts.get(sp, 0) + 1
+        c = av.get("cost") or {}
+        if isinstance(c, dict):
+            cost_total["llm_calls"] += int(c.get("llm_calls") or 0)
+            cost_total["tokens_in"] += int(c.get("tokens_in") or 0)
+            cost_total["tokens_out"] += int(c.get("tokens_out") or 0)
+            try:
+                cost_total["wall_seconds"] += float(c.get("wall_seconds") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                cost_total["cost_commercial_equivalent_usd"] += float(
+                    c.get("cost_commercial_equivalent_usd") or 0)
+            except (TypeError, ValueError):
+                pass
+        if av.get("changed_rule_hint"):
+            try:
+                advantage_over_tree_ids.append(str(row["id"]))
+            except (KeyError, IndexError):
+                pass
+    cost_total["wall_seconds"] = round(cost_total["wall_seconds"], 2)
+    cost_total["cost_commercial_equivalent_usd"] = round(
+        cost_total["cost_commercial_equivalent_usd"], 6)
+
     return {
         "per_agent": counters,
         "llm_fallback_runs": llm_fallback_runs,
@@ -2338,6 +2628,472 @@ def _aggregate_agent_metrics(rows) -> dict[str, Any]:
         "llm_fallback_by_agent": fallback_by_agent,
         "fast_path_skips": fast_path_skips,
         "autonomy": autonomy,
+        "agent_value": agent_value,
+        "agents_justified": {
+            sp: {"justified": justified_counts[sp], "runs": justified_runs[sp]}
+            for sp in justified_counts
+        },
+        "cost_total": cost_total,
+        "advantage_over_tree_ids": advantage_over_tree_ids,
+    }
+
+
+# ---------------------------------------------------------------- round 26
+# Round 26 (5.11.2026): 20 data-science metrics in the Agent value tab. The
+# owner wanted real metrics beyond the three existing cards. Ground truth is
+# the municipal worker's in-system feedback (agent_feedback), not an external
+# labeled catalog. The function returns None-valued panels with a 'pending'
+# note when there is not enough feedback to compute a metric - a 'metric not
+# yet populated' message, not a zero that reads as a failing score.
+
+
+def _percentile(sorted_vals: list[float], p: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    idx = max(0, min(len(sorted_vals) - 1, int(p * len(sorted_vals))))
+    return float(sorted_vals[idx])
+
+
+def _roc_auc_binary(scores: list[float], labels: list[int]) -> float | None:
+    """Mann-Whitney U formulation of binary ROC-AUC. Returns None if either
+    class has no samples (AUC undefined)."""
+    pos = [s for s, y in zip(scores, labels) if y == 1]
+    neg = [s for s, y in zip(scores, labels) if y == 0]
+    if not pos or not neg:
+        return None
+    wins = 0.0
+    for p in pos:
+        for n in neg:
+            if p > n:
+                wins += 1.0
+            elif p == n:
+                wins += 0.5
+    return wins / (len(pos) * len(neg))
+
+
+# The owner picked these eight D Classes exemplars on 6.11.2026 from a
+# sheet of catalogue candidates ranked by labelled-box size with the
+# detector agreeing on the class. A pinned id that is no longer a
+# single-label row of its class falls back to that ranking.
+_DC_PINNED_EXEMPLARS: dict[str, tuple[int, ...]] = {
+    "D00": (17029, 2920),
+    "D10": (5794, 11482),
+    "D20": (3396, 14438),
+    "D40": (10370, 7981),
+}
+
+
+def _dclass_exemplars(con, cls_code: str, pinned=(), n: int = 2) -> list[tuple[int, dict]]:
+    """(pic_id, box) pairs for one D class from the catalogue: the pinned
+    ids first, then the largest labelled boxes the detector agrees on,
+    one per photo. box is the first label as {cx, cy, w, h} in [0, 1]."""
+    def _box(labels_json) -> dict | None:
+        try:
+            labels = json.loads(labels_json or "[]")
+        except (TypeError, ValueError):
+            return None
+        if not labels or not isinstance(labels[0], dict):
+            return None
+        try:
+            return {k: float(labels[0][k]) for k in ("cx", "cy", "w", "h")}
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _stem(file_name) -> str:
+        return str(file_name or "").split("_jpg")[0]
+
+    out: list[tuple[int, dict]] = []
+    seen_stems: set[str] = set()
+    for pid in pinned:
+        row = con.execute(
+            "SELECT pic_id, file_name, labels_json FROM dataset_images "
+            "WHERE pic_id = ? AND classes = ? AND n_labels = 1",
+            (int(pid), cls_code),
+        ).fetchone()
+        box = _box(row[2]) if row else None
+        if box:
+            out.append((int(row[0]), box))
+            seen_stems.add(_stem(row[1]))
+    if len(out) >= n:
+        return out[:n]
+    ranked = []
+    for pid, file_name, labels_json in con.execute(
+        "SELECT pic_id, file_name, labels_json FROM dataset_images "
+        "WHERE classes = ? AND n_labels = 1 AND model_top1_class = ?",
+        (cls_code, cls_code),
+    ).fetchall():
+        box = _box(labels_json)
+        if box:
+            ranked.append((-(box["w"] * box["h"]), int(pid), _stem(file_name), box))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    seen_pids = {p for p, _ in out}
+    for _neg_area, pid, stem, box in ranked:
+        if pid in seen_pids or stem in seen_stems:
+            continue
+        seen_stems.add(stem)
+        out.append((pid, box))
+        if len(out) >= n:
+            break
+    return out
+
+
+_FEEDBACK_AGREE = {"agree"}
+_FEEDBACK_NEGATIVE = {"disagree", "not_relevant"}
+_PRED_CLASSES = ("standard", "human_review", "known_image", "needs_more_evidence")
+_FEEDBACK_VERDICTS = ("agree", "disagree", "not_relevant")
+
+
+def _compute_ds_metrics_block(
+    hazard_rows: list, feedback_rows: list
+) -> dict[str, Any]:
+    """Round 26 (5.11.2026): the 20-metric data-science block the owner
+    asked for. ``hazard_rows`` carries agent_decision + priority +
+    agent_value_json + agent_trace_json for each hazard in the window;
+    ``feedback_rows`` is the LATEST agent_feedback row per (hazard_id,
+    kind).
+
+    Every panel that needs feedback reports ``pending`` when it has too
+    few samples, so the UI shows 'metric not yet populated' instead of
+    a zero. Metrics derivable from the trace alone (uplift, cost,
+    justified histogram, grounding) populate with any n>=1 hazard.
+    """
+    import math as _math
+    n = len(hazard_rows or [])
+
+    # Group the feedback rows by (hazard_id, kind).
+    fb_hazard: dict[str, str] = {}
+    fb_priority: dict[str, str] = {}
+    for fr in feedback_rows or []:
+        try:
+            keys = fr.keys() if hasattr(fr, "keys") else []
+            kind = (fr["kind"] if "kind" in keys else "hazard") or "hazard"
+            verdict = (fr["verdict"] if "verdict" in keys else "") or ""
+            if not verdict and "agree" in keys:
+                verdict = "agree" if int(fr["agree"] or 0) else "disagree"
+            hid = fr["hazard_id"] if "hazard_id" in keys else None
+        except Exception:
+            continue
+        if not hid or not verdict:
+            continue
+        if kind == "priority":
+            fb_priority[hid] = verdict
+        else:
+            fb_hazard[hid] = verdict
+
+    # Per-hazard structured facts.
+    tokens_in: list[int] = []
+    tokens_out: list[int] = []
+    wall_s: list[float] = []
+    llm_calls_list: list[int] = []
+    cost_sum = 0.0
+    per_run_justified_count: list[int] = []
+    rule_tree_eq_final = 0
+    floor_fire = 0
+    llm_flip = 0
+    llm_clean_wins = 0
+    pred_action: dict[str, str] = {}
+    pred_priority: dict[str, int] = {}
+    grounding_ok = 0
+    grounding_total = 0
+
+    for row in hazard_rows or []:
+        try:
+            keys = row.keys() if hasattr(row, "keys") else []
+            hid = row["id"] if "id" in keys else None
+            dec = str(row["agent_decision"] if "agent_decision" in keys else "" or "").lower()
+            pri_val = 0
+            try:
+                pri_val = int(row["priority"] if "priority" in keys else 0 or 0)
+            except (TypeError, ValueError):
+                pri_val = 0
+            av_raw = (row["agent_value_json"] if "agent_value_json" in keys else "") or ""
+            tj_raw = (row["agent_trace_json"] if "agent_trace_json" in keys else "") or "[]"
+        except Exception:
+            continue
+        if hid:
+            pred_action[hid] = dec
+            pred_priority[hid] = pri_val
+
+        try:
+            av = json.loads(av_raw) if av_raw else {}
+        except (TypeError, ValueError):
+            av = {}
+        if not isinstance(av, dict):
+            av = {}
+
+        # Uplift: rule_tree_action == final_action? The JSON uses the
+        # *_action suffix; the trace file's 'rule_tree=X' is a render of
+        # these same fields, not a separate schema.
+        rt_action = av.get("rule_tree_action") or av.get("rule_tree")
+        final_action = av.get("final_action") or av.get("final")
+        llm_action = av.get("llm_proposed_action") or av.get("llm")
+        if rt_action and final_action and rt_action == final_action:
+            rule_tree_eq_final += 1
+        had_floor = bool(av.get("floor_applied")) or ("floor:" in str(av.get("flags") or ""))
+        if had_floor:
+            floor_fire += 1
+        llm_moved = (
+            isinstance(llm_action, str) and llm_action not in ("", "-", "none")
+            and rt_action and llm_action != rt_action
+        )
+        if llm_moved:
+            llm_flip += 1
+            if not had_floor and llm_action == final_action:
+                llm_clean_wins += 1
+
+        # Cost.
+        c = av.get("cost") or {}
+        if isinstance(c, dict):
+            try:
+                tokens_in.append(int(c.get("tokens_in") or 0))
+            except (TypeError, ValueError):
+                tokens_in.append(0)
+            try:
+                tokens_out.append(int(c.get("tokens_out") or 0))
+            except (TypeError, ValueError):
+                tokens_out.append(0)
+            try:
+                wall_s.append(float(c.get("wall_seconds") or 0))
+            except (TypeError, ValueError):
+                wall_s.append(0.0)
+            try:
+                llm_calls_list.append(int(c.get("llm_calls") or 0))
+            except (TypeError, ValueError):
+                llm_calls_list.append(0)
+            try:
+                cost_sum += float(c.get("cost_commercial_equivalent_usd") or 0)
+            except (TypeError, ValueError):
+                pass
+
+        # Justified count per run.
+        pa = av.get("per_agent_justified") or {}
+        j_count = 0
+        if isinstance(pa, dict):
+            for sp_data in pa.values():
+                if isinstance(sp_data, dict) and sp_data.get("justified"):
+                    j_count += 1
+        per_run_justified_count.append(j_count)
+
+        # Grounding score: for each hazard whose decision had cited
+        # sources, check that at least one citation appears in the RAG
+        # retriever's n_procedures passages. sec-X.Y tokens are the
+        # canonical citation form.
+        try:
+            trace = json.loads(tj_raw) if tj_raw else []
+        except (TypeError, ValueError):
+            trace = []
+        cited: list[str] = []
+        rag_secs: list[str] = []
+        for entry in trace or []:
+            if not isinstance(entry, dict):
+                continue
+            speaker = str(entry.get("speaker") or "")
+            c_entry = entry.get("content")
+            if not isinstance(c_entry, dict):
+                continue
+            if speaker == "rag_retriever":
+                procs = c_entry.get("procedures") or c_entry.get("passages") or []
+                for p in procs if isinstance(procs, list) else []:
+                    if isinstance(p, dict):
+                        sid = str(p.get("sec") or p.get("section") or p.get("id") or "")
+                        if sid:
+                            rag_secs.append(sid.lower())
+                    elif isinstance(p, str):
+                        rag_secs.append(p.lower())
+            elif speaker == "decision" and entry.get("kind") == "final":
+                cs = c_entry.get("cited_sources") or []
+                for s in cs if isinstance(cs, list) else []:
+                    sv = str(s).lower()
+                    if sv.startswith("sec-") or sv.startswith("sec_"):
+                        cited.append(sv)
+        if cited:
+            grounding_total += 1
+            if rag_secs and any(cs in rag_secs or any(cs in rs for rs in rag_secs) for cs in cited):
+                grounding_ok += 1
+
+    # 1-5 feedback agreement.
+    def _rate(num: int, den: int) -> float | None:
+        return round(100.0 * num / den, 1) if den else None
+
+    hz_votes = list(fb_hazard.values())
+    agree_n = sum(1 for v in hz_votes if v in _FEEDBACK_AGREE)
+    dis_n = sum(1 for v in hz_votes if v == "disagree")
+    nr_n = sum(1 for v in hz_votes if v == "not_relevant")
+    hazard_valid_rate = _rate(agree_n, len(hz_votes))
+
+    pri_votes = list(fb_priority.values())
+    pri_ok_n = sum(1 for v in pri_votes if v == "ok")
+    priority_correct_rate = _rate(pri_ok_n, len(pri_votes))
+
+    # Safety-floor precision: among hazards where a floor fired AND the
+    # worker voted, what % were marked agree. (Did the worker approve
+    # the floor's downgrade?)
+    floor_hids = {hid for hid in pred_action if hid in fb_hazard}
+    floor_fired_hids = set()
+    llm_flipped_hids = set()
+    for row in hazard_rows or []:
+        try:
+            hid = row["id"]
+            av_raw = row["agent_value_json"] or ""
+        except Exception:
+            continue
+        try:
+            av = json.loads(av_raw) if av_raw else {}
+        except (TypeError, ValueError):
+            av = {}
+        if not isinstance(av, dict):
+            continue
+        if bool(av.get("floor_applied")) or ("floor:" in str(av.get("flags") or "")):
+            floor_fired_hids.add(hid)
+        llm_a = av.get("llm_proposed_action") or av.get("llm")
+        rt_a = av.get("rule_tree_action") or av.get("rule_tree")
+        if (isinstance(llm_a, str) and llm_a not in ("", "-", "none")
+                and rt_a and llm_a != rt_a):
+            llm_flipped_hids.add(hid)
+    fp_intersect = [hid for hid in floor_fired_hids if hid in fb_hazard]
+    sf_precision = _rate(
+        sum(1 for hid in fp_intersect if fb_hazard[hid] in _FEEDBACK_AGREE),
+        len(fp_intersect),
+    )
+    lu_intersect = [hid for hid in llm_flipped_hids if hid in fb_hazard]
+    lu_precision = _rate(
+        sum(1 for hid in lu_intersect if fb_hazard[hid] in _FEEDBACK_AGREE),
+        len(lu_intersect),
+    )
+
+    # By-decision-class breakdown: the confusion-matrix rows.
+    by_class: dict[str, dict[str, int]] = {}
+    for c in _PRED_CLASSES:
+        by_class[c] = {v: 0 for v in _FEEDBACK_VERDICTS}
+        by_class[c]["total"] = 0
+    for hid, verdict in fb_hazard.items():
+        c = pred_action.get(hid) or ""
+        if c not in by_class:
+            continue
+        if verdict in _FEEDBACK_VERDICTS:
+            by_class[c][verdict] += 1
+            by_class[c]["total"] += 1
+
+    # Per-class precision and F1 (binary: agree=1, disagree/not_relevant=0
+    # within each predicted class). Recall is NOT derivable from this
+    # feedback schema (we have no explicit 'should have been X' label
+    # when the worker disagreed), so F1 here is 2*P*A / (P+A) where A is
+    # the window-wide agreement rate used as a stand-in. The UI calls
+    # this out explicitly as a precision score, not a classical F1.
+    per_class_f1: dict[str, dict[str, Any]] = {}
+    agree_overall = _rate(agree_n, len(hz_votes))
+    for c in _PRED_CLASSES:
+        tot = by_class[c]["total"]
+        if tot:
+            p = round(100.0 * by_class[c]["agree"] / tot, 1)
+        else:
+            p = None
+        per_class_f1[c] = {
+            "precision_pct": p,
+            "n": tot,
+            "agree": by_class[c]["agree"],
+            "disagree": by_class[c]["disagree"],
+            "not_relevant": by_class[c]["not_relevant"],
+        }
+    # Macro/weighted precision across the four decision classes.
+    vals = [(per_class_f1[c]["precision_pct"], per_class_f1[c]["n"])
+            for c in _PRED_CLASSES if per_class_f1[c]["precision_pct"] is not None]
+    if vals:
+        macro = round(sum(v for v, _ in vals) / len(vals), 1)
+        wsum = sum(v * nn for v, nn in vals)
+        nsum = sum(nn for _, nn in vals)
+        weighted = round(wsum / nsum, 1) if nsum else None
+    else:
+        macro = None
+        weighted = None
+
+    # ROC-AUC: can we discriminate worker-agreed vs not using agent priority?
+    scores: list[float] = []
+    labels: list[int] = []
+    for hid, verdict in fb_hazard.items():
+        if hid not in pred_priority:
+            continue
+        scores.append(float(pred_priority[hid]))
+        labels.append(1 if verdict in _FEEDBACK_AGREE else 0)
+    auc = _roc_auc_binary(scores, labels)
+    if auc is not None:
+        auc = round(auc, 3)
+
+    # Confusion matrix 4x3.
+    confusion = [
+        [by_class[c][v] for v in _FEEDBACK_VERDICTS]
+        for c in _PRED_CLASSES
+    ]
+
+    # Uplift rates.
+    def _pct(num: int) -> float:
+        return round(100.0 * num / n, 1) if n else 0.0
+
+    uplift = {
+        "rule_tree_eq_final_rate": _pct(rule_tree_eq_final),
+        "floor_fire_rate": _pct(floor_fire),
+        "llm_flip_rate": _pct(llm_flip),
+        "llm_clean_wins": llm_clean_wins,
+    }
+
+    # Cost extended.
+    tokens_in_sorted = sorted(tokens_in)
+    tokens_out_sorted = sorted(tokens_out)
+    wall_sorted = sorted(wall_s)
+    cost_ext = {
+        "tokens_in_mean": round(sum(tokens_in) / len(tokens_in), 1) if tokens_in else 0.0,
+        "tokens_in_p95": int(_percentile(tokens_in_sorted, 0.95)),
+        "tokens_out_mean": round(sum(tokens_out) / len(tokens_out), 1) if tokens_out else 0.0,
+        "tokens_out_p95": int(_percentile(tokens_out_sorted, 0.95)),
+        "cost_per_case_usd": round(cost_sum / n, 4) if n else 0.0,
+        "wall_p50_s": round(_percentile(wall_sorted, 0.50), 1),
+        "wall_p95_s": round(_percentile(wall_sorted, 0.95), 1),
+        "llm_calls_per_case_mean": round(sum(llm_calls_list) / len(llm_calls_list), 2)
+        if llm_calls_list else 0.0,
+    }
+
+    # Justified histogram.
+    histogram = {k: 0 for k in range(0, 7)}
+    for v in per_run_justified_count:
+        histogram[min(6, max(0, v))] += 1
+
+    # Grounding.
+    grounding_rate = _rate(grounding_ok, grounding_total)
+
+    return {
+        "n_hazards": n,
+        "n_feedback_hazard": len(fb_hazard),
+        "n_feedback_priority": len(fb_priority),
+        "feedback_agreement": {
+            "hazard_valid_rate": hazard_valid_rate,
+            "priority_correct_rate": priority_correct_rate,
+            "safety_floor_precision": sf_precision,
+            "safety_floor_n": len(fp_intersect),
+            "llm_uplift_precision": lu_precision,
+            "llm_uplift_n": len(lu_intersect),
+            "hazard_counts": {"agree": agree_n, "disagree": dis_n, "not_relevant": nr_n},
+            "priority_counts": {
+                "ok": pri_ok_n,
+                "too_low": sum(1 for v in pri_votes if v == "too_low"),
+                "too_high": sum(1 for v in pri_votes if v == "too_high"),
+            },
+            "by_decision_class": by_class,
+        },
+        "uplift": uplift,
+        "cost_ext": cost_ext,
+        "justified_histogram": histogram,
+        "ds_metrics": {
+            "confusion_matrix": confusion,
+            "confusion_rows": list(_PRED_CLASSES),
+            "confusion_cols": list(_FEEDBACK_VERDICTS),
+            "per_class_precision": per_class_f1,
+            "precision_macro_pct": macro,
+            "precision_weighted_pct": weighted,
+            "roc_auc": auc,
+            "roc_auc_n": len(scores),
+            "grounding_score_pct": grounding_rate,
+            "grounding_n": grounding_total,
+        },
     }
 
 
@@ -3226,11 +3982,14 @@ def create_app() -> FastAPI:
         NOW = datetime.now(timezone.utc)
         CUT = NOW - timedelta(hours=window_hours)
         cutoff_epoch = CUT.timestamp()
-        con = sqlite3.connect("/var/lib/roadguard/roadguard.db")
+        # The hazards table the API writes (ROADGUARD_DB_PATH), not a fixed
+        # path: the digest showed nothing when the two differed.
+        con = sqlite3.connect(get_settings().roadguard_db_path)
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "SELECT id, agent_decision, priority, agent_rationale, reported_at, location, "
-            "status, cited_sources_json, agent_trace_json "
+            "SELECT id, class, confidence, agent_decision, priority, agent_rationale, "
+            "       reported_at, location, status, cited_sources_json, agent_trace_json, "
+            "       agent_value_json, bboxes_json, reporter_text "
             "FROM hazards WHERE reported_at >= ? ORDER BY reported_at DESC",
             (cutoff_epoch,),
         ).fetchall()
@@ -3241,6 +4000,39 @@ def create_app() -> FastAPI:
             counts[k if k in counts else "other"] += 1
         approvals_pending = con.execute("SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
         evidence_open = con.execute("SELECT COUNT(*) FROM evidence_requests WHERE status='pending'").fetchone()[0]
+        # Round 22 (4.11.2026): agent value snapshot for the KPI strip -
+        # how often the workers' LLM moved the rule tree, per the same
+        # per-case summary written to hazards.agent_value_json.
+        av_rows = con.execute(
+            "SELECT agent_value_json FROM hazards WHERE reported_at >= ? AND agent_value_json != ''",
+            (cutoff_epoch,),
+        ).fetchall()
+        # Round 23 (4.11.2026): also walk the full trace aggregator so the
+        # per-agent panel in the Agent value tab can read per_agent /
+        # agents_justified / cost_total from one source. The call is
+        # cheap (reads the same rows the digest already fetched).
+        aggregates = _aggregate_agent_metrics(rows)
+        av_counts = {"runs": 0, "changed_rule_hint": 0,
+                     "profile_llm_changed": 0, "research_llm_changed": 0,
+                     "enforcement_rule_tree_verdict": 0, "floor_applied": 0}
+        for r in av_rows:
+            try:
+                avj = json.loads(r["agent_value_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(avj, dict):
+                continue
+            av_counts["runs"] += 1
+            if avj.get("changed_rule_hint"):
+                av_counts["changed_rule_hint"] += 1
+            if avj.get("profile_llm_changed"):
+                av_counts["profile_llm_changed"] += 1
+            if avj.get("research_llm_changed"):
+                av_counts["research_llm_changed"] += 1
+            if avj.get("enforcement") == "rule_tree_verdict":
+                av_counts["enforcement_rule_tree_verdict"] += 1
+            if avj.get("floor_applied"):
+                av_counts["floor_applied"] += 1
 
         # #11: hazard clusters. Group hazards of the same class at the same
         # free-text location within the window; anything with 3+ reports is
@@ -3283,19 +4075,47 @@ def create_app() -> FastAPI:
                 cited = json.loads(r["cited_sources_json"] or "[]")
             except Exception:
                 cited = []
-            img_rel = f"/images/{r['id']}" if os.path.isfile(f"/var/lib/roadguard/images/{r['id']}.jpg") else ""
+            # Round 23 iter 4 (4.11.2026): always set the image URL so
+            # the detail pane can retry; the client uses onerror to hide
+            # the <img> when the file is still being written. The old
+            # os.path.isfile gate hid freshly ingested images for up to
+            # one digest refresh window (~30s).
+            img_rel = f"/images/{r['id']}"
+            try:
+                av = json.loads(r["agent_value_json"] or "{}")
+            except Exception:
+                av = {}
+            per_agent = av.get("per_agent_justified") or {}
+            # Round 23 iter 4: YOLO live confidence for the hazard, read
+            # from the hazards row directly (the `confidence` column is
+            # the YOLO top1_confidence stamped on submission).
+            try:
+                score = float(r["confidence"]) if r["confidence"] is not None else None
+            except (TypeError, ValueError, IndexError):
+                score = None
             cases.append({
                 "id": r["id"],
                 "decision": (r["agent_decision"] or "n/a").lower(),
                 "priority": r["priority"],
                 "status": r["status"] or "open",
                 "location": r["location"] or "(not provided)",
+                "reporter_text": r["reporter_text"] or "",
+                "interrupted": _trace_has_event(trace, "graph_interrupted"),
                 "reported_at": r["reported_at"] or 0,
                 "rationale": r["agent_rationale"] or "",
                 "speakers": speakers,
                 "cited": cited,
                 "image": img_rel,
                 "n_trace": len(trace),
+                "justified_count": av.get("agents_justified_count"),
+                "agents_total": av.get("agents_total"),
+                "rule_tree_action": av.get("rule_tree_action"),
+                "final_action": av.get("final_action"),
+                "changed_rule_hint": bool(av.get("changed_rule_hint")),
+                "per_agent_justified": per_agent,
+                "hazard_class": (r["class"] or "").upper(),
+                "score": score,
+                "bboxes": (lambda: json.loads(r["bboxes_json"] or "[]") if r["bboxes_json"] else [])(),
             })
         con.close()
         cases_json = json.dumps(cases)
@@ -3311,39 +4131,148 @@ def create_app() -> FastAPI:
 
         # Overview tiles are inlined above the Cases table so the operator
         # sees the headline numbers and the cases themselves on one scroll.
+        # Round 23 (4.11.2026): agreement with the rule tree moved out of
+        # the main strip into the new "Agent value" tab (see agent_value_html
+        # below). The main strip keeps the queue counters and the second
+        # round-22 row on their own, as the operator asked.
+        correct_pct = 100.0 * sum(
+            1 for r in av_rows if (r["agent_value_json"] or "") and
+            (json.loads(r["agent_value_json"]).get("rule_tree_action")
+             == json.loads(r["agent_value_json"]).get("final_action"))
+        ) / max(1, av_counts["runs"]) if av_counts["runs"] else 0.0
+        # Round 23 iter 4 (4.11.2026): owner asked for ONE row with only
+        # the essentials - the queue shape plus the two agent-value
+        # counts that matter to the owner's eye (LLM changed tree, floor
+        # fired). The other twelve tiles moved out; deeper detail lives
+        # in the Agent value tab.
         kpi_strip = (
             "<div class='kpi-strip'>"
             f"<div class='kpi'><div class='kpi-v'>{len(rows)}</div><div class='kpi-l'>New reports</div></div>"
             f"<div class='kpi urgent'><div class='kpi-v'>{counts['urgent']}</div><div class='kpi-l'>Urgent</div></div>"
-            f"<div class='kpi standard'><div class='kpi-v'>{counts['standard']}</div><div class='kpi-l'>Standard queue</div></div>"
             f"<div class='kpi human'><div class='kpi-v'>{counts['human_review']}</div><div class='kpi-l'>Human review</div></div>"
-            f"<div class='kpi evi'><div class='kpi-v'>{counts['needs_more_evidence']}</div><div class='kpi-l'>Needs more evidence</div></div>"
-            f"<div class='kpi'><div class='kpi-v'>{counts['known_image']}</div><div class='kpi-l'>Known image</div></div>"
-            f"<div class='kpi'><div class='kpi-v'>{approvals_pending}</div><div class='kpi-l'>Approvals pending</div></div>"
-            f"<div class='kpi'><div class='kpi-v'>{evidence_open}</div><div class='kpi-l'>Awaiting photo</div></div>"
+            f"<div class='kpi standard'><div class='kpi-v'>{counts['standard']}</div><div class='kpi-l'>Standard</div></div>"
+            f"<div class='kpi'><div class='kpi-v'>{av_counts['changed_rule_hint']}</div><div class='kpi-l'>LLM changed the rule tree</div></div>"
+            f"<div class='kpi'><div class='kpi-v'>{av_counts['floor_applied']}</div><div class='kpi-l'>Floor applied</div></div>"
             "</div>"
         )
 
+        # Round 23 (4.11.2026): readable hazard label - the YOLO class
+        # the agents identified in the image, with its plain name so a
+        # city worker reads it without the dataset code.
+        _HAZARD_LABEL = {
+            "D00": "longitudinal crack",
+            "D10": "transverse crack",
+            "D20": "alligator crack",
+            "D40": "pothole",
+        }
+
+        def _hazard_label(cls_code: str) -> str:
+            code = (cls_code or "").upper()
+            name = _HAZARD_LABEL.get(code, "")
+            return f"{code} {name}".strip() if code else "n/a"
+
         if rows:
+            # Fetch the per-case class the AGENTS identified (profile
+            # builder's primary_class, with the YOLO live detection as
+            # the fallback when the agent left it blank) alongside the
+            # existing hazards.class column.
+            id_to_class = {}
+            for r in rows:
+                try:
+                    trace = json.loads(r["agent_trace_json"] or "[]")
+                except Exception:
+                    trace = []
+                primary = ""
+                for e in trace:
+                    if not isinstance(e, dict):
+                        continue
+                    if e.get("speaker") == "profile_builder":
+                        pc = (e.get("content") or {}).get("primary_class")
+                        if pc:
+                            primary = str(pc).upper()
+                            break
+                id_to_class[r["id"]] = primary or str(r["class"] or "")
             rows_html_parts = []
+            # Round 23 iter 4 (4.11.2026): class filter counters for the
+            # sub-tabs above the Cases table.
+            class_counts = {"ALL": 0, "D00": 0, "D10": 0, "D20": 0, "D40": 0, "OTHER": 0}
+            for c in cases:
+                code = (id_to_class.get(c["id"]) or "").upper()
+                class_counts["ALL"] += 1
+                if code in class_counts:
+                    class_counts[code] += 1
+                else:
+                    class_counts["OTHER"] += 1
             for i, c in enumerate(cases, 1):
                 ts = datetime.fromtimestamp(c["reported_at"], timezone.utc).strftime("%H:%M")
                 d = html.escape(c["decision"])
                 cls = _css_for(c["decision"])
+                hid = html.escape(c['id'])
+                cls_code = (id_to_class.get(c["id"]) or "").upper() or "OTHER"
+                hazard_label = html.escape(_hazard_label(id_to_class.get(c["id"], "")))
+                # Round 23 iter 5 (4.11.2026): per-row feedback has TWO
+                # axes - identification (hazard: agree/disagree/not
+                # relevant) and urgency (priority: ok / too low / too
+                # high). Each axis's clicked button picks up the active-*
+                # class so the active vote per axis is visible without
+                # a separate column.
+                hazard_cell = (
+                    f"<button class='fb-btn fb-agree' data-id='{hid}' data-kind='hazard' data-verdict='agree' title='Hazard was correctly identified'>Agree</button>"
+                    f"<button class='fb-btn fb-disagree' data-id='{hid}' data-kind='hazard' data-verdict='disagree' title='Hazard identification is wrong'>Disagree</button>"
+                    f"<button class='fb-btn fb-nr' data-id='{hid}' data-kind='hazard' data-verdict='not_relevant' title='Image is not a hazard / noise / other'>Not relevant</button>"
+                )
+                priority_cell = (
+                    f"<button class='fb-btn fb-pri-ok' data-id='{hid}' data-kind='priority' data-verdict='ok' title='Priority is right'>OK</button>"
+                    f"<button class='fb-btn fb-pri-lo' data-id='{hid}' data-kind='priority' data-verdict='too_low' title='Priority should be higher'>Too low</button>"
+                    f"<button class='fb-btn fb-pri-hi' data-id='{hid}' data-kind='priority' data-verdict='too_high' title='Priority should be lower'>Too high</button>"
+                )
+                score_text = f"{c['score']:.2f}" if c.get("score") is not None else "-"
+                int_tag = (
+                    " <span class='tag-int' title='the service restarted during the run; "
+                    "no agent analysis, routed to a human'>interrupted</span>"
+                    if c.get("interrupted") else ""
+                )
                 rows_html_parts.append(
-                    f"<tr data-idx='{i-1}' class='row'>"
+                    f"<tr data-idx='{i-1}' data-hzc='{cls_code}' class='row'>"
                     f"<td>{i}</td>"
                     f"<td><code>{html.escape(c['id'][:12])}</code></td>"
-                    f"<td class='{cls}'>{d}</td>"
+                    f"<td class='td-hazard'>{hazard_label}</td>"
+                    f"<td class='td-score'>{score_text}</td>"
+                    f"<td class='{cls}'>{d}{int_tag}</td>"
                     f"<td>{c['priority'] or ''}</td>"
+                    f"<td class='td-act' data-hid='{hid}' data-kind='hazard'>{hazard_cell}</td>"
+                    f"<td class='td-act' data-hid='{hid}' data-kind='priority'>{priority_cell}</td>"
                     f"<td>{html.escape(c['location'])[:60]}</td>"
                     f"<td>{ts}</td>"
                     f"</tr>"
                 )
             rows_html = "".join(rows_html_parts)
+            class_chip_bar_parts = []
+            for code in ("ALL", "D40", "D20", "D00", "D10", "OTHER"):
+                if code != "ALL" and class_counts.get(code, 0) == 0:
+                    continue
+                active_cls = " active" if code == "ALL" else ""
+                chip_label = "ALL" if code == "ALL" else _hazard_label(code)
+                class_chip_bar_parts.append(
+                    f"<button class='cls-chip{active_cls}' data-cls='{code}'>"
+                    f"{html.escape(chip_label)} "
+                    f"<span class='cls-n'>({class_counts.get(code, 0)})</span>"
+                    f"</button>"
+                )
+            class_chip_bar = (
+                "<div class='cls-chips' id='cls-chips'>"
+                + "".join(class_chip_bar_parts) + "</div>"
+            )
             table_html = (
+                class_chip_bar +
                 "<table class='cases'>"
-                "<thead><tr><th>#</th><th>id</th><th>decision</th><th>priority</th><th>location</th><th>time</th></tr></thead>"
+                "<thead><tr><th>#</th><th>id</th>"
+                "<th title='Hazard type the agents identified in the image'>hazard the agents saw</th>"
+                "<th title='YOLO live confidence (0-1)'>score</th>"
+                "<th>decision</th><th>priority</th>"
+                "<th title='Was the agent right about the hazard?'>hazard feedback</th>"
+                "<th title='Was the agent right about the urgency / priority?'>priority feedback</th>"
+                "<th>location</th><th>time</th></tr></thead>"
                 f"<tbody id='rows'>{rows_html}</tbody>"
                 "</table>"
             )
@@ -3406,11 +4335,10 @@ def create_app() -> FastAPI:
                 "</div>"
             )
         else:
-            clusters_html = (
-                "<div class='clusters-wrap'>"
-                f"<p class='k'>No clusters (no location+class group with &ge; 3 reports in the last {window_hours}h). Add a few more submissions from the same place and this table will fill in.</p>"
-                "</div>"
-            )
+            # Round 23 iter 4 (4.11.2026): owner asked to drop the empty-
+            # state placeholder ("No clusters..."), the whole block is
+            # hidden when no clusters exist in the window.
+            clusters_html = ""
 
         header = (
             f"<header class='topbar'>"
@@ -3424,7 +4352,9 @@ def create_app() -> FastAPI:
             f"</header>"
             f"<nav class='tabs' id='tabs'>"
             f"<button class='tab-btn active' data-tab='cases'>Cases ({len(rows)})</button>"
-            f"<button class='tab-btn' data-tab='timeline'>Timeline</button>"
+            f"<button class='tab-btn' data-tab='agentvalue'>Agent value</button>"
+            f"<button class='tab-btn' data-tab='dclasses'>D Classes</button>"
+            f"<button class='tab-btn' data-tab='ruletree'>Rule tree</button>"
             f"</nav>"
         )
 
@@ -3479,7 +4409,14 @@ def create_app() -> FastAPI:
         /* Detail panel */
         .detail{position:sticky;top:110px;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px;max-height:calc(100vh - 130px);overflow-y:auto}
         .detail h3{margin:0 0 8px;font-size:15px;letter-spacing:-0.01em}
-        .detail .d-img{width:100%;max-height:280px;object-fit:cover;border-radius:8px;background:#f1f5f9;margin-bottom:12px;display:block}
+        .detail .d-img{width:100%;max-height:280px;object-fit:cover;border-radius:8px;background:#f1f5f9;display:block}
+        .detail .d-img-wrap{position:relative;margin-bottom:12px;border-radius:8px;overflow:hidden}
+        .detail .d-bbox,.dc-imgwrap .d-bbox{position:absolute;border:2px solid #22d3ee;box-shadow:0 0 0 1px rgba(0,0,0,0.4);box-sizing:border-box;pointer-events:none}
+        .detail .d-bbox.d-bbox-D00,.dc-imgwrap .d-bbox.d-bbox-D00{border-color:#f59e0b}
+        .detail .d-bbox.d-bbox-D10,.dc-imgwrap .d-bbox.d-bbox-D10{border-color:#a855f7}
+        .detail .d-bbox.d-bbox-D20,.dc-imgwrap .d-bbox.d-bbox-D20{border-color:#ef4444}
+        .detail .d-bbox.d-bbox-D40,.dc-imgwrap .d-bbox.d-bbox-D40{border-color:#22d3ee}
+        .detail .d-bbox-lbl{position:absolute;top:-18px;left:0;background:rgba(17,24,39,0.85);color:#fff;font-family:ui-monospace,monospace;font-size:10px;font-weight:700;padding:2px 5px;border-radius:3px;white-space:nowrap}
         .detail .d-row{display:flex;justify-content:space-between;gap:12px;margin:6px 0;font-size:13px}
         .detail .d-row b{color:#6b7280;font-weight:500}
         .detail .d-rat{background:#f8fafc;border-radius:6px;padding:10px;font-size:13px;line-height:1.5;margin:8px 0}
@@ -3496,6 +4433,101 @@ def create_app() -> FastAPI:
         .tl-item .tl-body{padding:0 14px 12px 38px;border-top:1px solid #f1f5f9}
         .tl-item .tl-pipe{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#6b7280;margin:8px 0 4px}
         .tl-item .tl-r{font-size:13px;color:#374151;line-height:1.5;margin-top:6px}
+        /* Round 23 iter 4: hazard-label + score cells, 3 feedback buttons
+           (always clickable, active verdict gets the active-* class),
+           class-filter chips, and the Priority tab. */
+        .td-hazard{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#1f2937;white-space:nowrap}
+        .td-score{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#1f2937;white-space:nowrap;text-align:right}
+        .fb-btn{appearance:none;background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;margin:0 2px;font-weight:600;transition:background 0.1s,color 0.1s}
+        .fb-btn.fb-agree{color:#166534;border-color:#86efac}
+        .fb-btn.fb-disagree{color:#991b1b;border-color:#fecaca}
+        .fb-btn.fb-nr{color:#6b7280;border-color:#d1d5db}
+        .fb-btn.fb-pri-ok{color:#166534;border-color:#86efac}
+        .fb-btn.fb-pri-lo{color:#92400e;border-color:#fde68a}
+        .fb-btn.fb-pri-hi{color:#1e3a8a;border-color:#93c5fd}
+        .fb-btn:hover{background:#f9fafb}
+        .fb-btn.active-agree,.fb-btn.active-ok{background:#dcfce7;color:#166534;border-color:#86efac}
+        .fb-btn.active-disagree{background:#fee2e2;color:#991b1b;border-color:#fecaca}
+        .fb-btn.active-nr,.fb-btn.active-not_relevant{background:#f3f4f6;color:#1f2937;border-color:#d1d5db}
+        .fb-btn.active-too_low{background:#fef3c7;color:#92400e;border-color:#fde68a}
+        .fb-btn.active-too_high{background:#dbeafe;color:#1e3a8a;border-color:#93c5fd}
+        .fb-btn.flash-ok{animation:flash-ok-anim 0.6s ease-out}
+        @keyframes flash-ok-anim{0%{box-shadow:0 0 0 0 rgba(34,197,94,0.6)}100%{box-shadow:0 0 0 6px rgba(34,197,94,0)}}
+        .fb-btn.flash-err{animation:flash-err-anim 0.6s ease-out}
+        @keyframes flash-err-anim{0%{box-shadow:0 0 0 0 rgba(239,68,68,0.6)}100%{box-shadow:0 0 0 6px rgba(239,68,68,0)}}
+        .td-act{white-space:nowrap}
+        /* Class filter chips above the Cases table */
+        .cls-chips{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
+        .cls-chip{appearance:none;background:#fff;border:1px solid #d1d5db;border-radius:999px;padding:5px 12px;font-size:12px;cursor:pointer;font-weight:600;color:#374151;font-family:ui-monospace,monospace}
+        .cls-chip:hover{background:#f9fafb}
+        .cls-chip.active{background:#0ea5e9;color:#fff;border-color:#0ea5e9}
+        .cls-chip .cls-n{opacity:0.75;font-weight:500}
+        /* D Classes tab */
+        .dc-wrap{max-width:100%}
+        .dc-h{margin:0 0 6px;font-size:16px;font-weight:700;color:#111827}
+        .dc-sub{color:#6b7280;font-size:13px;margin:0 0 18px}
+        .dc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}
+        .dc-card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:6px}
+        .dc-code{font-family:ui-monospace,monospace;font-size:12px;color:#6b7280;font-weight:700}
+        .dc-name{font-size:14px;font-weight:700;color:#111827}
+        .dc-pair{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+        .dc-imgwrap{position:relative;aspect-ratio:1/1;border-radius:6px;overflow:hidden;background:#f3f4f6}
+        .dc-img{width:100%;height:100%;object-fit:contain;display:block}
+        .dc-img-missing{display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:12px;font-style:italic}
+        .dc-desc{font-size:12px;color:#374151;line-height:1.4}
+        /* Agent value tab */
+        .av-wrap{max-width:1100px}
+        .av-h{margin:0 0 10px;font-size:16px;font-weight:700;color:#111827}
+        .av-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+        .av-card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px;text-align:center}
+        .av-card.ok{border-left:4px solid #16a34a}
+        .av-card.fail{border-left:4px solid #dc2626}
+        .av-v{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:28px;font-weight:800;color:#0ea5e9;line-height:1.1}
+        .av-card.ok .av-v{color:#16a34a}
+        .av-card.fail .av-v{color:#dc2626}
+        .av-l{font-size:13px;color:#374151;margin-top:4px;font-weight:600}
+        .av-t{font-size:11px;color:#6b7280;margin-top:2px}
+        .av-overrides{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:14px;font-size:13px}
+        .av-overrides .av-ov-row{padding:8px 0;border-bottom:1px solid #f1f5f9}
+        .av-overrides .av-ov-row:last-child{border-bottom:0}
+        .av-ov-id{font-family:ui-monospace,monospace;color:#1d4ed8;font-weight:600}
+        /* Round 23: per-agent breakdown grid in the Agent value tab */
+        .ag-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+        .ag-card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:14px}
+        .ag-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;border-bottom:1px solid #f1f5f9;padding-bottom:6px}
+        .ag-name{font-family:ui-monospace,monospace;font-weight:700;color:#111827;font-size:14px}
+        .ag-just{font-family:ui-monospace,monospace;font-size:12px;color:#166534;font-weight:600}
+        .ag-metrics{display:grid;grid-template-columns:1fr;gap:4px}
+        .ag-metric{display:flex;justify-content:space-between;font-size:12px}
+        .ag-m-k{color:#374151}
+        .ag-m-v{font-family:ui-monospace,monospace;font-weight:700;color:#111827}
+        /* Round 26 (5.11.2026): the data-science metric panels in the
+           Agent value tab. Histogram is a 7-bar block (0..6 of 6 agents
+           justified) and the confusion matrix is a plain table. */
+        .ds-hist{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:14px;min-height:110px;display:flex;align-items:flex-end;gap:8px;justify-content:space-around}
+        .ds-hist .ds-bar{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;min-width:30px}
+        .ds-hist .ds-bar-fill{background:#2563eb;border-radius:4px 4px 0 0;width:100%;min-height:2px;transition:height 0.3s}
+        .ds-hist .ds-bar-lbl{font-size:11px;color:#374151;font-family:ui-monospace,monospace}
+        .ds-hist .ds-bar-val{font-size:12px;color:#111827;font-weight:700;font-family:ui-monospace,monospace}
+        .ds-hist-note{color:#6b7280;font-size:13px;text-align:center;width:100%}
+        .ds-conf-wrap{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:14px;overflow-x:auto}
+        .ds-conf-note{color:#6b7280;font-size:13px;text-align:center}
+        .ds-conf-table{border-collapse:collapse;font-size:13px;margin:0 auto}
+        .ds-conf-table th,.ds-conf-table td{border:1px solid #e5e7eb;padding:8px 14px;text-align:center;font-family:ui-monospace,monospace}
+        .ds-conf-table th{background:#f3f4f6;font-weight:700;color:#111827}
+        .ds-conf-table .ds-row-hdr{background:#f9fafb;font-weight:600;color:#374151;text-align:left}
+        .ds-conf-table .ds-cell-agree{background:rgba(22,163,74,0.08);color:#166534;font-weight:700}
+        .ds-conf-table .ds-cell-dis{background:rgba(220,38,38,0.08);color:#991b1b;font-weight:700}
+        .ds-conf-table .ds-cell-nr{background:rgba(234,88,12,0.08);color:#9a3412;font-weight:700}
+        .ds-conf-table .ds-cell-precision{background:#eff6ff;color:#1e40af;font-weight:700}
+        /* Rule tree: the SVG scales to the canvas width, so the whole
+           tree is visible without panning. */
+        .rt-wrap{max-width:100%}
+        .rt-h{margin:0 0 6px;font-size:16px;font-weight:700;color:#111827}
+        .rt-sub{color:#6b7280;font-size:13px;margin:0 0 10px}
+        .rt-canvas{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px;overflow:hidden}
+        .rt-svg{width:100%;height:auto;display:block}
+        .tag-int{display:inline-block;margin-left:6px;padding:0 7px;border-radius:999px;background:#fef3c7;color:#92400e;font-size:11px;font-weight:600;vertical-align:middle}
         """
 
         script = """
@@ -3512,18 +4544,37 @@ def create_app() -> FastAPI:
           rows.forEach(r => r.classList.toggle('sel', +r.dataset.idx === idx));
           const c = CASES[idx];
           if (!c) { detail.innerHTML = '<div class="d-empty">Pick a case on the left.</div>'; return; }
-          const img = c.image
-            ? `<img class="d-img" src="${c.image}" alt="citizen photo">`
-            : '<div class="d-img" style="display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:12px;height:160px">(photo not available)</div>';
+          // Round 23 iter 6 (4.11.2026): always try the image URL and
+          // overlay YOLO bboxes on top of the photo so the worker sees
+          // exactly where the agents said the hazard was. The overlay
+          // is positioned by percentages against the image's natural
+          // size, so it scales with the <img> on resize. The onload /
+          // onerror handlers use global helpers (__rgDrawBoxes /
+          // __rgImgErr) to keep the quoting simple inside this inline
+          // template.
+          const imgPath = c.image || (urlBase() + '/images/' + c.id);
+          const bboxes = c.bboxes || [];
+          const bboxDataAttr = bboxes.length
+            ? ' data-bboxes="' + encodeURIComponent(JSON.stringify(bboxes)) + '"'
+            : '';
+          const img = (
+            '<div class="d-img-wrap"' + bboxDataAttr + '>' +
+            '<img class="d-img" src="' + imgPath + '" alt="citizen photo" ' +
+            'onload="window.__rgDrawBoxes && window.__rgDrawBoxes(this)" ' +
+            'onerror="window.__rgImgErr && window.__rgImgErr(this)">' +
+            '</div>'
+          );
           const cited = c.cited && c.cited.length ? c.cited.map(s => `<code>${s}</code>`).join(', ') : '<i>none cited</i>';
           const decCls = c.decision === 'urgent' ? 'urgent' : (c.decision === 'human_review' ? 'human' : (c.decision === 'standard' ? 'standard' : 'evi'));
           detail.innerHTML = `
             <h3>Case <code>${c.id}</code></h3>
             ${img}
             <div class="d-row"><b>Decision</b><span class="${decCls}">${c.decision}</span></div>
+            ${c.interrupted ? '<div class="d-row"><b>Run</b><span class="human">interrupted by a service restart: no agent analysis behind this verdict, routed to a human</span></div>' : ''}
             <div class="d-row"><b>Priority</b><span>${c.priority ?? 'n/a'}</span></div>
             <div class="d-row"><b>Status</b><span>${c.status}</span></div>
             <div class="d-row"><b>Location</b><span>${c.location}</span></div>
+            ${c.reporter_text ? '<div class="d-row"><b>Reporter wrote</b><span>' + String(c.reporter_text).replace(/[&<>]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[ch])) + '</span></div>' : ''}
             <div class="d-row"><b>Pipeline</b><span class="d-sources">${c.speakers || '(empty)'}</span></div>
             <div class="d-rat">${c.rationale || '<i>empty rationale</i>'}</div>
             <div class="d-row"><b>Cited sources</b><span class="d-sources">${cited}</span></div>
@@ -3531,6 +4582,314 @@ def create_app() -> FastAPI:
         }
         rows.forEach(r => r.addEventListener('click', () => pick(+r.dataset.idx)));
         if (rows.length) pick(0);
+        // Round 23 iter 3 (4.11.2026): three-button worker feedback.
+        // Buttons stay clickable (undo / change your mind), each click
+        // POSTs a new verdict row that becomes the case's latest. Any
+        // HTTP non-2xx flashes the button red and does NOT update the
+        // 'your vote' pill, so the worker sees his click did NOT save.
+        function urlBase() { return location.pathname.replace(/\\/digest.*/, ''); }
+        // Round 23 iter 6 (4.11.2026): draw YOLO bboxes on the detail-
+        // pane image. bboxes format: [[x1, y1, x2, y2, class, conf], ...]
+        // in the image's own pixel space; the overlay uses percentages of
+        // naturalWidth / naturalHeight so it scales with the <img>.
+        window.__rgImgErr = function(imgEl) {
+          try {
+            imgEl.style.display = 'none';
+            const p = document.createElement('div');
+            p.className = 'd-img';
+            p.style.cssText = 'display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:12px;height:160px';
+            p.textContent = '(photo not yet written)';
+            if (imgEl.parentNode) imgEl.parentNode.insertBefore(p, imgEl);
+          } catch (e) { /* silent */ }
+        };
+        window.__rgDrawBoxes = function(imgEl) {
+          try {
+            const wrap = imgEl.closest('.d-img-wrap');
+            if (!wrap) return;
+            wrap.querySelectorAll('.d-bbox').forEach(b => b.remove());
+            const raw = wrap.dataset.bboxes;
+            if (!raw) return;
+            const bboxes = JSON.parse(decodeURIComponent(raw));
+            const w = imgEl.naturalWidth, h = imgEl.naturalHeight;
+            if (!w || !h) return;
+            bboxes.forEach((b, i) => {
+              const [x1, y1, x2, y2, cls, conf] = b;
+              const left = (100 * x1 / w) + '%';
+              const top = (100 * y1 / h) + '%';
+              const width = (100 * (x2 - x1) / w) + '%';
+              const height = (100 * (y2 - y1) / h) + '%';
+              const div = document.createElement('div');
+              div.className = 'd-bbox d-bbox-' + (cls || '').replace(/[^A-Za-z0-9]/g, '');
+              div.style.cssText = 'left:' + left + ';top:' + top +
+                ';width:' + width + ';height:' + height;
+              const lbl = document.createElement('div');
+              lbl.className = 'd-bbox-lbl';
+              lbl.textContent = (cls || '?') + ' ' + (conf ? Number(conf).toFixed(2) : '');
+              div.appendChild(lbl);
+              wrap.appendChild(div);
+            });
+          } catch (e) { /* silent */ }
+        };
+        const ACTIVE_CLASSES = ['active-agree','active-disagree','active-nr','active-not_relevant','active-ok','active-too_low','active-too_high'];
+        // Round 23 iter 5 (4.11.2026): mark the verdict per (hazard, kind)
+        // axis so hazard feedback and priority feedback are visible
+        // together.
+        function markVote(hid, kind, verdict) {
+          const sel = ".td-act[data-hid='" + hid + "'][data-kind='" + kind + "'] .fb-btn";
+          document.querySelectorAll(sel).forEach(b => {
+            ACTIVE_CLASSES.forEach(c => b.classList.remove(c));
+            if (b.dataset.verdict === verdict) {
+              b.classList.add('active-' + verdict);
+            }
+          });
+        }
+        function clearVote(hid, kind) {
+          const sel = ".td-act[data-hid='" + hid + "'][data-kind='" + kind + "'] .fb-btn";
+          document.querySelectorAll(sel).forEach(b => {
+            ACTIVE_CLASSES.forEach(c => b.classList.remove(c));
+          });
+        }
+        // Round 23 iter 4: class-filter chips above the Cases table.
+        function bindClassChips() {
+          const chips = document.querySelectorAll('.cls-chip');
+          chips.forEach(chip => {
+            chip.addEventListener('click', () => {
+              chips.forEach(c => c.classList.toggle('active', c === chip));
+              const target = chip.dataset.cls || 'ALL';
+              document.querySelectorAll('.cases tr.row').forEach(r => {
+                r.style.display = (target === 'ALL' || r.dataset.hzc === target)
+                  ? '' : 'none';
+              });
+            });
+          });
+        }
+        bindClassChips();
+        function create(tag, cls, text) {
+          const n = document.createElement(tag);
+          if (cls) n.className = cls;
+          if (text != null) n.textContent = text;
+          return n;
+        }
+        function bindFbButtons(root) {
+          (root || document).querySelectorAll('.fb-btn').forEach(btn => {
+            if (btn.dataset.bound === '1') return;
+            btn.dataset.bound = '1';
+            btn.addEventListener('click', async (ev) => {
+              ev.stopPropagation();
+              const hid = btn.dataset.id;
+              const kind = btn.dataset.kind || 'hazard';
+              const verdict = btn.dataset.verdict || 'agree';
+              try {
+                const r = await fetch(urlBase() + '/agent_feedback/' + encodeURIComponent(hid), {
+                  method: 'POST',
+                  headers: {'content-type': 'application/json'},
+                  body: JSON.stringify({kind: kind, verdict: verdict, note: ''}),
+                });
+                if (!r.ok) { throw new Error('http ' + r.status); }
+                btn.classList.remove('flash-err');
+                btn.offsetWidth; // reflow to retrigger animation
+                btn.classList.add('flash-ok');
+                setTimeout(() => btn.classList.remove('flash-ok'), 700);
+                markVote(hid, kind, verdict);
+                refreshAgentValue();
+              } catch (e) {
+                btn.classList.remove('flash-ok');
+                btn.offsetWidth;
+                btn.classList.add('flash-err');
+                setTimeout(() => btn.classList.remove('flash-err'), 700);
+              }
+            });
+          });
+        }
+        bindFbButtons(document);
+        // Round 23 iter 3: load the latest vote per hazard and paint
+        // the 'your vote' cells, so a worker reloading the page sees
+        // what he already voted. Polled every 30s by the digest's own
+        // refresh timer.
+        async function refreshVotes() {
+          try {
+            const d = await fetch(urlBase() + '/agent_feedback/by_hazard?window_hours=24', {cache:'no-store'})
+                      .then(r => r.json());
+            const byH = d.by_hazard || {};
+            document.querySelectorAll('.td-act[data-hid]').forEach(td => {
+              const hid = td.dataset.hid;
+              const kind = td.dataset.kind || 'hazard';
+              const entry = byH[hid];
+              const v = entry && entry[kind];
+              if (v && v.verdict) markVote(hid, kind, v.verdict);
+              else clearVote(hid, kind);
+            });
+          } catch (e) { /* silent */ }
+        }
+        refreshVotes();
+        // Round 23: the Agent value tab loads the three-verdict counters
+        // from /stats/feedback, refreshes after every button click.
+        async function refreshAgentValue() {
+          try {
+            const base = location.pathname.replace(/\\/digest.*/, '');
+            const d = await fetch(base + '/stats/feedback?window_hours=24', {cache:'no-store'})
+                      .then(r => r.json());
+            const hz = d.hazard || {agree:0, disagree:0, not_relevant:0, total_cases_voted:0};
+            const pri = d.priority || {ok:0, too_low:0, too_high:0, total_cases_voted:0};
+            const hzTotal = hz.total_cases_voted || 0;
+            function setCard(idv, idt, n, total, kind) {
+              const v = document.getElementById(idv);
+              const t = document.getElementById(idt);
+              if (v) v.textContent = String(n);
+              if (t) t.textContent = total ? (n + ' of ' + total + ' cases voted') : 'no ' + kind + ' votes yet';
+            }
+            setCard('av-agree-v', 'av-agree-t', hz.agree || 0, hzTotal, 'hazard');
+            setCard('av-dis-v',   'av-dis-t',   hz.disagree || 0, hzTotal, 'hazard');
+            setCard('av-nr-v',    'av-nr-t',    hz.not_relevant || 0, hzTotal, 'hazard');
+            function renderList(id, items, empty) {
+              const list = document.getElementById(id);
+              if (!list) return;
+              if (!items || !items.length) {
+                list.innerHTML = '<div class="k" style="color:#6b7280">' + empty + '</div>';
+                return;
+              }
+              list.innerHTML = items.map(o =>
+                '<div class="av-ov-row"><span class="av-ov-id">' + (o.hazard_id || '').substring(0,12) +
+                '</span> &middot; <b>' + (o.class || '') + '</b> &middot; agent said <b>' + (o.decision || '') +
+                '</b>' + (o.note ? ' &middot; <i>' + o.note + '</i>' : '') + '</div>'
+              ).join('');
+            }
+            renderList('av-disagree-list', d.disagrees, 'No disagreements yet.');
+            renderList('av-nr-list', d.not_relevants, "No 'not relevant' flags yet.");
+          } catch (e) { /* silent */ }
+        }
+        refreshAgentValue();
+        // Round 26 (5.11.2026): fetch /stats/ds_metrics and render the
+        // 20 data-science panels in the Agent value tab. A metric that
+        // comes back null displays 'pending feedback' rather than 0.
+        async function refreshDsMetrics() {
+          try {
+            const base = location.pathname.replace(/\/digest.*/, '');
+            const d = await fetch(base + '/stats/ds_metrics?window_hours=24', {cache:'no-store'})
+                      .then(r => r.json());
+            function setM(idv, idt, value, hint, suffix) {
+              const v = document.getElementById(idv);
+              const t = document.getElementById(idt);
+              if (!v) return;
+              if (value === null || value === undefined) {
+                v.textContent = '-';
+                if (t) t.textContent = hint || 'pending feedback';
+              } else {
+                v.textContent = String(value) + (suffix || '');
+                if (t && hint) t.textContent = hint;
+              }
+            }
+            const fa = d.feedback_agreement || {};
+            const upl = d.uplift || {};
+            const cx = d.cost_ext || {};
+            const ds = d.ds_metrics || {};
+            const nH = d.n_feedback_hazard || 0;
+            const nP = d.n_feedback_priority || 0;
+            // 1-5: feedback agreement
+            setM('ds-m1-v','ds-m1-t', fa.hazard_valid_rate,
+                 nH ? ('based on ' + nH + ' hazard votes') : 'pending feedback', '%');
+            // M2: compute disagree_rate from counts
+            const hc = fa.hazard_counts || {};
+            const dis_rate = (nH > 0) ? Math.round(100.0 * (hc.disagree || 0) / nH * 10) / 10 : null;
+            setM('ds-m2-v','ds-m2-t', dis_rate,
+                 nH ? ('based on ' + nH + ' hazard votes') : 'pending feedback', '%');
+            setM('ds-m3-v','ds-m3-t', fa.priority_correct_rate,
+                 nP ? ('based on ' + nP + ' priority votes') : 'pending feedback', '%');
+            setM('ds-m4-v','ds-m4-t', fa.safety_floor_precision,
+                 (fa.safety_floor_n || 0) ? ('n=' + fa.safety_floor_n + ' floor cases with feedback') : 'no floor cases voted yet', '%');
+            setM('ds-m5-v','ds-m5-t', fa.llm_uplift_precision,
+                 (fa.llm_uplift_n || 0) ? ('n=' + fa.llm_uplift_n + ' LLM-flip cases with feedback') : 'no LLM-flip cases voted yet', '%');
+            // 6-9: uplift
+            setM('ds-m6-v','ds-m6-t', upl.rule_tree_eq_final_rate, 'higher = agents added nothing', '%');
+            setM('ds-m7-v','ds-m7-t', upl.floor_fire_rate, 'how often the floor caught the LLM', '%');
+            setM('ds-m8-v','ds-m8-t', upl.llm_flip_rate, 'LLM changed rule_tree verdict', '%');
+            setM('ds-m9-v','ds-m9-t', upl.llm_clean_wins, 'flip + no floor (LLM standalone value)', '');
+            // 10-13: cost
+            const mIn = cx.tokens_in_mean, pIn = cx.tokens_in_p95;
+            const mOut = cx.tokens_out_mean, pOut = cx.tokens_out_p95;
+            document.getElementById('ds-m10-v').textContent = (mIn !== undefined)
+              ? (Math.round(mIn) + ' / ' + Math.round(mOut)) : '-';
+            document.getElementById('ds-m10-t').textContent = (pIn !== undefined)
+              ? ('p95: ' + pIn + ' in / ' + pOut + ' out') : 'pending data';
+            setM('ds-m11-v','ds-m11-t', (cx.cost_per_case_usd === undefined) ? null : cx.cost_per_case_usd,
+                 'self-hosted $0', '');
+            document.getElementById('ds-m11-v').textContent = (cx.cost_per_case_usd !== undefined)
+              ? ('$' + (cx.cost_per_case_usd).toFixed(4)) : '-';
+            document.getElementById('ds-m12-v').textContent = (cx.wall_p50_s !== undefined)
+              ? (cx.wall_p50_s + ' / ' + cx.wall_p95_s) : '-';
+            document.getElementById('ds-m12-t').textContent = 'per-case latency (s)';
+            setM('ds-m13-v','ds-m13-t', (cx.llm_calls_per_case_mean === undefined) ? null : cx.llm_calls_per_case_mean,
+                 'mean over the window', '');
+            // 14-15: justified histogram
+            const hist = d.justified_histogram || {};
+            const histWrap = document.getElementById('ds-hist');
+            if (histWrap) {
+              const total = Object.values(hist).reduce((a,b) => a+b, 0);
+              if (!total) {
+                histWrap.innerHTML = '<div class="ds-hist-note">pending data</div>';
+              } else {
+                const maxV = Math.max(...Object.values(hist));
+                let bars = '';
+                for (let k = 0; k <= 6; k++) {
+                  const v = hist[k] || 0;
+                  const h = maxV ? Math.round(80 * v / maxV) : 0;
+                  bars += '<div class="ds-bar"><div class="ds-bar-val">' + v + '</div>' +
+                          '<div class="ds-bar-fill" style="height:' + h + 'px"></div>' +
+                          '<div class="ds-bar-lbl">' + k + ' of 6</div></div>';
+                }
+                histWrap.innerHTML = bars;
+              }
+            }
+            // 16: confusion matrix + 17: per-class precision
+            const confWrap = document.getElementById('ds-conf-wrap');
+            if (confWrap) {
+              const rows = ds.confusion_rows || [];
+              const cols = ds.confusion_cols || [];
+              const mat = ds.confusion_matrix || [];
+              const perCls = ds.per_class_precision || {};
+              const totalFb = rows.reduce((a, r) => a + ((perCls[r] || {}).n || 0), 0);
+              if (!totalFb) {
+                confWrap.innerHTML = '<div class="ds-conf-note">pending feedback</div>';
+              } else {
+                let h = '<table class="ds-conf-table"><thead><tr><th>agent said \\ worker</th>';
+                for (const c of cols) h += '<th>' + c.replace(/_/g,' ') + '</th>';
+                h += '<th>total</th><th>M17 precision</th></tr></thead><tbody>';
+                for (let i = 0; i < rows.length; i++) {
+                  const r = rows[i];
+                  h += '<tr><td class="ds-row-hdr">' + r.replace(/_/g,' ') + '</td>';
+                  for (let j = 0; j < cols.length; j++) {
+                    const cls = j === 0 ? 'ds-cell-agree' : (j === 1 ? 'ds-cell-dis' : 'ds-cell-nr');
+                    h += '<td class="' + cls + '">' + ((mat[i] || [])[j] || 0) + '</td>';
+                  }
+                  const pc = perCls[r] || {};
+                  h += '<td>' + (pc.n || 0) + '</td>';
+                  h += '<td class="ds-cell-precision">' + (pc.precision_pct !== null && pc.precision_pct !== undefined
+                        ? pc.precision_pct + '%' : 'n/a') + '</td>';
+                  h += '</tr>';
+                }
+                h += '</tbody></table>';
+                confWrap.innerHTML = h;
+              }
+            }
+            // M18: macro / weighted precision
+            const pm = ds.precision_macro_pct, pw = ds.precision_weighted_pct;
+            document.getElementById('ds-m18-v').textContent = (pm !== null && pm !== undefined)
+              ? (pm + '% / ' + (pw === null ? 'n/a' : pw + '%')) : '-';
+            document.getElementById('ds-m18-t').textContent = (pm !== null && pm !== undefined)
+              ? 'macro (equal class weight) / weighted (by n)' : 'pending feedback';
+            // M19: ROC-AUC
+            const auc = ds.roc_auc, aucN = ds.roc_auc_n || 0;
+            setM('ds-m19-v','ds-m19-t', auc,
+                 aucN ? ('based on ' + aucN + ' feedback samples') : 'pending feedback', '');
+            // M20: grounding score
+            const gs = ds.grounding_score_pct, gn = ds.grounding_n || 0;
+            setM('ds-m20-v','ds-m20-t', gs,
+                 gn ? ('based on ' + gn + ' cited cases') : 'no citations yet', '%');
+          } catch (e) { /* silent */ }
+        }
+        refreshDsMetrics();
+        setInterval(refreshDsMetrics, 30000);
+        setInterval(refreshVotes, 30000);
         // Silent background refresh: re-fetch the page HTML, swap in the
         // KPIs + table + timeline sections only, preserve the user's active
         // tab, selected row, and scroll position so the page never jumps.
@@ -3538,7 +4897,7 @@ def create_app() -> FastAPI:
           try {
             const html = await fetch(location.href, {cache: 'no-store'}).then(r => r.text());
             const doc = new DOMParser().parseFromString(html, 'text/html');
-            const parts = ['.kpi-strip', 'tbody#rows', '#pane-timeline .tl'];
+            const parts = ['.kpi-strip', 'tbody#rows'];
             for (const sel of parts) {
               const next = doc.querySelector(sel);
               const cur = document.querySelector(sel);
@@ -3550,11 +4909,453 @@ def create_app() -> FastAPI:
             const newRows = document.querySelectorAll('.cases tr.row');
             const selId = (CASES[0] || {}).id;
             newRows.forEach(r => r.addEventListener('click', () => pick(+r.dataset.idx)));
+            bindFbButtons(document);
           } catch (e) { /* silent */ }
         }
         setInterval(refresh, 30000);
+        setInterval(refreshAgentValue, 30000);
         """.replace("__CASES__", cases_json)
 
+        # The D Classes tab: two exemplars per class (D00 / D10 / D20 /
+        # D40) from the labelled catalog, each with its labelled box
+        # drawn, so the worker sees the damage the class name means.
+        with sqlite3.connect(get_settings().roadguard_db_path) as _dc_con:
+            _dc_pics = {
+                c: _dclass_exemplars(_dc_con, c, _DC_PINNED_EXEMPLARS.get(c, ()))
+                for c in ("D00", "D10", "D20", "D40")
+            }
+        _DC_DESCRIPTIONS = {
+            "D00": ("D00 Longitudinal crack",
+                    "A single crack running along the direction of travel. "
+                    "Often appears near the wheel path or lane line."),
+            "D10": ("D10 Transverse crack",
+                    "A crack running across the direction of travel, roughly "
+                    "perpendicular to the road axis."),
+            "D20": ("D20 Alligator crack",
+                    "A network of interconnected cracks forming irregular polygons, "
+                    "resembling alligator skin. Indicates structural fatigue."),
+            "D40": ("D40 Pothole",
+                    "A bowl-shaped depression in the surface. Varies in diameter "
+                    "and depth; may have sharp or broken edges."),
+        }
+        dc_cards: list[str] = []
+        for code in ("D00", "D10", "D20", "D40"):
+            name, desc = _DC_DESCRIPTIONS[code]
+            tiles: list[str] = []
+            for pic_id, box in _dc_pics.get(code) or []:
+                box_style = (
+                    f"left:{100 * (box['cx'] - box['w'] / 2):.2f}%;"
+                    f"top:{100 * (box['cy'] - box['h'] / 2):.2f}%;"
+                    f"width:{100 * box['w']:.2f}%;height:{100 * box['h']:.2f}%"
+                )
+                tiles.append(
+                    f"<div class='dc-imgwrap'>"
+                    f"<img class='dc-img' src='/roadguard/catalog_image/{pic_id}' "
+                    f"alt='{html.escape(name)}' onerror=\"this.style.display='none';\">"
+                    f"<div class='d-bbox d-bbox-{code}' style='{box_style}'></div>"
+                    f"</div>"
+                )
+            img_html = (
+                f"<div class='dc-pair'>{''.join(tiles)}</div>"
+                if tiles else
+                "<div class='dc-img dc-img-missing'>no exemplar in catalog</div>"
+            )
+            dc_cards.append(
+                f"<div class='dc-card'>"
+                f"<div class='dc-code'>{html.escape(code)}</div>"
+                f"<div class='dc-name'>{html.escape(name)}</div>"
+                f"{img_html}"
+                f"<div class='dc-desc'>{html.escape(desc)}</div>"
+                f"</div>"
+            )
+        d_classes_html = (
+            "<div class='dc-wrap'>"
+            "<h3 class='dc-h'>D-class reference</h3>"
+            "<p class='dc-sub'>Two examples per class from the labelled catalog, the labelled box drawn on each. "
+            "Use as a side-by-side reference when voting on the hazard the agents saw.</p>"
+            f"<div class='dc-grid'>{''.join(dc_cards)}</div>"
+            "</div>"
+        )
+
+        # Round 23 (4.11.2026): the "Agent value" tab. Four top cards for
+        # the rule-tree agreement + the three worker-verdict counters,
+        # then a per-agent panel that lists each of the six agents with
+        # its runs, justified count and the behaviour counters pulled
+        # from _aggregate_agent_metrics. Everything but the per-agent
+        # panel updates live from /stats/feedback on every click.
+        per_agent_rows = ""
+        _PER_AGENT_METRICS = [
+            ("sanitize", [
+                ("location_scrubbed", "PII scrubbed"),
+                ("ocr_suspicious", "OCR injection blocked"),
+                ("reporter_text_suspicious", "Suspicious text filtered"),
+            ]),
+            ("signal_extractor", [
+                ("has_text", "Cases with reporter text"),
+                ("llm_used", "LLM calls run"),
+            ]),
+            ("supervisor", [
+                ("concern_input_ambiguous", "Flagged input ambiguous"),
+                ("concern_budget_tight", "Flagged budget tight"),
+                ("concern_none", "No concern raised"),
+            ]),
+            ("profile_builder", [
+                ("catalog_hit", "Catalogue hits"),
+                ("class_matches_detector", "Agent class matches detector"),
+                ("llm_used", "LLM calls run"),
+            ]),
+            ("rag_retriever", [
+                ("coverage_direct_match", "Direct match"),
+                ("llm_used", "LLM calls run"),
+                ("total_passages_returned", "Passages returned"),
+            ]),
+            ("decision", [
+                ("rule_based", "Rule-based verdicts"),
+                ("llm_based", "LLM-based verdicts"),
+                ("contradiction_floor", "Floors fired"),
+            ]),
+        ]
+        for sp, metrics in _PER_AGENT_METRICS:
+            block = aggregates["per_agent"].get(sp, {}) if isinstance(aggregates.get("per_agent"), dict) else {}
+            aj = (aggregates.get("agents_justified") or {}).get(sp, {}) if isinstance(aggregates.get("agents_justified"), dict) else {}
+            justified = aj.get("justified", 0) if isinstance(aj, dict) else 0
+            runs = aj.get("runs", 0) if isinstance(aj, dict) else 0
+            metric_cells = "".join(
+                f"<div class='ag-metric'><span class='ag-m-k'>{html.escape(label)}</span>"
+                f"<span class='ag-m-v'>{block.get(key, 0)}</span></div>"
+                for key, label in metrics
+            )
+            per_agent_rows += (
+                f"<div class='ag-card'>"
+                f"<div class='ag-head'><span class='ag-name'>{sp}</span>"
+                f"<span class='ag-just'>{justified} / {runs} justified</span></div>"
+                f"<div class='ag-metrics'>{metric_cells}</div>"
+                f"</div>"
+            )
+        aggregates_json = {
+            "per_agent": aggregates.get("per_agent"),
+            "agents_justified": aggregates.get("agents_justified"),
+            "cost_total": aggregates.get("cost_total"),
+        }
+        # The window has to be set up for the aggregates call just above
+        # to have content for this snapshot: use the same 24h window the
+        # digest already reads.
+        agent_value_html = (
+            "<div class='av-wrap'>"
+            "<h3 class='av-h'>How much is the agent worth right now</h3>"
+            "<div class='av-grid'>"
+            f"<div class='av-card {'ok' if correct_pct >= 85 else 'fail'}'>"
+            f"<div class='av-v'>{correct_pct:.0f}%</div>"
+            f"<div class='av-l'>Agreement with the rule tree</div>"
+            f"<div class='av-t'>target 85%</div></div>"
+            "<div class='av-card' id='av-agree-card'>"
+            "<div class='av-v' id='av-agree-v'>0</div>"
+            "<div class='av-l'>Cases worker agreed with</div>"
+            "<div class='av-t' id='av-agree-t'>no votes yet</div></div>"
+            "<div class='av-card' id='av-dis-card'>"
+            "<div class='av-v' id='av-dis-v'>0</div>"
+            "<div class='av-l'>Cases worker disagreed with</div>"
+            "<div class='av-t' id='av-dis-t'>no votes yet</div></div>"
+            "<div class='av-card' id='av-nr-card'>"
+            "<div class='av-v' id='av-nr-v'>0</div>"
+            "<div class='av-l'>Cases worker marked not relevant</div>"
+            "<div class='av-t' id='av-nr-t'>no votes yet</div></div>"
+            "</div>"
+            # Round 26 (5.11.2026): the 20 data-science metrics the owner
+            # asked for. Five panels, all inside Agent value (no new tab).
+            # Each number renders 'pending' when there is not enough
+            # feedback yet, so a sparse day shows honestly and not a zero.
+            "<h3 class='av-h' style='margin-top:22px'>Feedback agreement (1-5)</h3>"
+            "<div class='av-grid'>"
+            "<div class='av-card' id='ds-m1-card'>"
+            "<div class='av-v' id='ds-m1-v'>-</div>"
+            "<div class='av-l'>M1 Hazard-valid rate</div>"
+            "<div class='av-t' id='ds-m1-t'>pending feedback</div></div>"
+            "<div class='av-card' id='ds-m2-card'>"
+            "<div class='av-v' id='ds-m2-v'>-</div>"
+            "<div class='av-l'>M2 Hazard-disagree rate</div>"
+            "<div class='av-t' id='ds-m2-t'>pending feedback</div></div>"
+            "<div class='av-card' id='ds-m3-card'>"
+            "<div class='av-v' id='ds-m3-v'>-</div>"
+            "<div class='av-l'>M3 Priority-correct rate</div>"
+            "<div class='av-t' id='ds-m3-t'>pending feedback</div></div>"
+            "<div class='av-card' id='ds-m4-card'>"
+            "<div class='av-v' id='ds-m4-v'>-</div>"
+            "<div class='av-l'>M4 Safety-floor precision</div>"
+            "<div class='av-t' id='ds-m4-t'>pending feedback</div></div>"
+            "<div class='av-card' id='ds-m5-card'>"
+            "<div class='av-v' id='ds-m5-v'>-</div>"
+            "<div class='av-l'>M5 LLM-uplift precision</div>"
+            "<div class='av-t' id='ds-m5-t'>pending feedback</div></div>"
+            "</div>"
+            "<h3 class='av-h' style='margin-top:22px'>Agent uplift over the rule tree (6-9)</h3>"
+            "<div class='av-grid'>"
+            "<div class='av-card' id='ds-m6-card'>"
+            "<div class='av-v' id='ds-m6-v'>-</div>"
+            "<div class='av-l'>M6 rule_tree == final</div>"
+            "<div class='av-t' id='ds-m6-t'>higher = agents added nothing</div></div>"
+            "<div class='av-card' id='ds-m7-card'>"
+            "<div class='av-v' id='ds-m7-v'>-</div>"
+            "<div class='av-l'>M7 Safety-floor fire rate</div>"
+            "<div class='av-t' id='ds-m7-t'>how often the floor caught the LLM</div></div>"
+            "<div class='av-card' id='ds-m8-card'>"
+            "<div class='av-v' id='ds-m8-v'>-</div>"
+            "<div class='av-l'>M8 LLM flip rate</div>"
+            "<div class='av-t' id='ds-m8-t'>LLM changed rule_tree verdict</div></div>"
+            "<div class='av-card' id='ds-m9-card'>"
+            "<div class='av-v' id='ds-m9-v'>-</div>"
+            "<div class='av-l'>M9 LLM clean wins</div>"
+            "<div class='av-t' id='ds-m9-t'>flip + no floor (LLM standalone value)</div></div>"
+            "</div>"
+            "<h3 class='av-h' style='margin-top:22px'>Cost and latency (10-13)</h3>"
+            "<div class='av-grid'>"
+            "<div class='av-card' id='ds-m10-card'>"
+            "<div class='av-v' id='ds-m10-v'>-</div>"
+            "<div class='av-l'>M10 Tokens in / out (mean)</div>"
+            "<div class='av-t' id='ds-m10-t'>p95 shown as well</div></div>"
+            "<div class='av-card' id='ds-m11-card'>"
+            "<div class='av-v' id='ds-m11-v'>-</div>"
+            "<div class='av-l'>M11 $ per case (commercial equiv)</div>"
+            "<div class='av-t' id='ds-m11-t'>self-hosted $0</div></div>"
+            "<div class='av-card' id='ds-m12-card'>"
+            "<div class='av-v' id='ds-m12-v'>-</div>"
+            "<div class='av-l'>M12 Wall p50 / p95 (s)</div>"
+            "<div class='av-t' id='ds-m12-t'>per-case latency</div></div>"
+            "<div class='av-card' id='ds-m13-card'>"
+            "<div class='av-v' id='ds-m13-v'>-</div>"
+            "<div class='av-l'>M13 LLM calls per case</div>"
+            "<div class='av-t' id='ds-m13-t'>mean over the window</div></div>"
+            "</div>"
+            "<h3 class='av-h' style='margin-top:22px'>Per-agent justified histogram (14-15)</h3>"
+            "<div id='ds-hist' class='ds-hist'>"
+            "<div class='ds-hist-note'>pending data</div></div>"
+            "<h3 class='av-h' style='margin-top:22px'>Confusion matrix and class-wise precision (16-20)</h3>"
+            "<div id='ds-conf-wrap' class='ds-conf-wrap'>"
+            "<div class='ds-conf-note'>pending feedback</div></div>"
+            "<div class='av-grid' style='margin-top:12px'>"
+            "<div class='av-card' id='ds-m18-card'>"
+            "<div class='av-v' id='ds-m18-v'>-</div>"
+            "<div class='av-l'>M18 Precision macro / weighted</div>"
+            "<div class='av-t' id='ds-m18-t'>pending feedback</div></div>"
+            "<div class='av-card' id='ds-m19-card'>"
+            "<div class='av-v' id='ds-m19-v'>-</div>"
+            "<div class='av-l'>M19 ROC-AUC (priority vs agree)</div>"
+            "<div class='av-t' id='ds-m19-t'>pending feedback</div></div>"
+            "<div class='av-card' id='ds-m20-card'>"
+            "<div class='av-v' id='ds-m20-v'>-</div>"
+            "<div class='av-l'>M20 Grounding score</div>"
+            "<div class='av-t' id='ds-m20-t'>citations in retrieved passages</div></div>"
+            "</div>"
+            "<h3 class='av-h' style='margin-top:22px'>Each agent and its metrics (last 24h)</h3>"
+            f"<div class='ag-grid'>{per_agent_rows}</div>"
+            "<h3 class='av-h' style='margin-top:18px'>Cases the worker disagreed with (last 24h)</h3>"
+            "<div id='av-disagree-list' class='av-overrides'>No disagreements yet.</div>"
+            "<h3 class='av-h' style='margin-top:18px'>Cases the worker marked 'not relevant' (last 24h)</h3>"
+            "<div id='av-nr-list' class='av-overrides'>No 'not relevant' flags yet.</div>"
+            "</div>"
+        )
+        # Round 23 iter 4 (4.11.2026): rule tree expanded. The owner saw
+        # the earlier version as cut off at the edges and missing the
+        # depth of the real _decide_rule_based tree. This one draws the
+        # catalog-detector-contradiction floor, the evidence-declined
+        # branch, the YOLO-confidence band gate on the severity side,
+        # and the LLM-failed safety net, in one SVG whose width scales
+        # to the viewport (max-width, overflow-x: auto on the canvas).
+        rule_tree_html = """
+        <div class='rt-wrap'>
+          <h3 class='rt-h'>Rule tree the agent is compared against</h3>
+          <p class='rt-sub'>Deterministic baseline. Every agent verdict is scored against the leaf this tree would have picked.</p>
+          <div class='rt-canvas' id='rt-canvas'>
+            <svg viewBox='0 0 2180 1150' xmlns='http://www.w3.org/2000/svg' class='rt-svg' preserveAspectRatio='xMinYMin meet'>
+              <style>
+                .rt-svg .n rect{fill:#fff;stroke:#334155;stroke-width:1.5;rx:8;ry:8}
+                .rt-svg .n text{font:600 13px -apple-system,Segoe UI,Roboto,sans-serif;fill:#111827}
+                .rt-svg .leaf text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+                .rt-svg .edge{stroke:#334155;stroke-width:1.5;fill:none}
+                .rt-svg .edge-lbl{font:600 11px -apple-system,Segoe UI,Roboto,sans-serif;fill:#334155;text-anchor:middle}
+                .rt-svg .divider{stroke:#cbd5e1;stroke-dasharray:4,4;stroke-width:1}
+                .rt-svg .section-lbl{font:700 11px -apple-system,Segoe UI,Roboto,sans-serif;fill:#6b7280;letter-spacing:0.04em;text-anchor:middle}
+              </style>
+
+              <!-- Root -> sha256 -->
+              <path class='edge' d='M900,62 V100'/>
+
+              <!-- sha256 match? -> known branch (yes) and -> new-photo branch (no), elbow at y=180 -->
+              <path class='edge' d='M900,152 V180 H300 V210'/>
+              <path class='edge' d='M900,152 V180 H1200 V210'/>
+              <text class='edge-lbl' x='600' y='172'>yes (same file)</text>
+              <text class='edge-lbl' x='1050' y='172'>no (new photo)</text>
+
+              <!-- known branch: detector class matches catalog labels? -->
+              <path class='edge' d='M300,262 V310'/>
+              <text class='edge-lbl' x='300' y='290'>catalogue agrees with detector?</text>
+              <path class='edge' d='M300,362 V390 H150 V420'/>
+              <path class='edge' d='M300,362 V390 H450 V420'/>
+              <text class='edge-lbl' x='210' y='383'>yes</text>
+              <text class='edge-lbl' x='390' y='383'>no (floor)</text>
+
+              <!-- new-photo branch: phash? -->
+              <path class='edge' d='M1200,262 V310'/>
+
+              <!-- phash yes -> human_review (phash floor); phash no -> evidence_declined? -->
+              <path class='edge' d='M1200,362 V390 H900 V420'/>
+              <path class='edge' d='M1200,362 V390 H1500 V420'/>
+              <text class='edge-lbl' x='1050' y='383'>yes (class mismatch)</text>
+              <text class='edge-lbl' x='1350' y='383'>no</text>
+
+              <!-- evidence_declined? -->
+              <path class='edge' d='M1500,472 V510 H1200 V540'/>
+              <path class='edge' d='M1500,472 V510 H1700 V540'/>
+              <text class='edge-lbl' x='1340' y='503'>yes (declined)</text>
+              <text class='edge-lbl' x='1600' y='503'>no (carry on)</text>
+
+              <!-- severity_signal? -->
+              <path class='edge' d='M1700,592 V630'/>
+
+              <!-- severity? -> three subtrees -->
+              <path class='edge' d='M1700,682 V710 H1430 V740'/>
+              <path class='edge' d='M1700,682 V740'/>
+              <path class='edge' d='M1700,682 V710 H1980 V740'/>
+              <text class='edge-lbl' x='1565' y='703'>severe / recurring</text>
+              <text class='edge-lbl' x='1750' y='703'>moderate</text>
+              <text class='edge-lbl' x='1900' y='703'>minor</text>
+
+              <!-- severity=moderate: YOLO confidence band? -->
+              <path class='edge' d='M1700,792 V820 H1620 V850'/>
+              <path class='edge' d='M1700,792 V820 H1780 V850'/>
+              <text class='edge-lbl' x='1660' y='813'>low conf</text>
+              <text class='edge-lbl' x='1860' y='813'>high conf</text>
+
+              <!-- severity=minor: confidence band? -->
+              <path class='edge' d='M1980,792 V820 H1900 V850'/>
+              <path class='edge' d='M1980,792 V820 H2060 V850'/>
+              <text class='edge-lbl' x='1940' y='813'>low conf</text>
+              <text class='edge-lbl' x='2140' y='813'>high conf</text>
+
+              <!-- Divider + safety net -->
+              <line class='divider' x1='40' y1='960' x2='2140' y2='960'/>
+              <text class='section-lbl' x='900' y='983'>SAFETY NET (applies to any leaf above)</text>
+
+              <!-- LLM failed? -->
+              <path class='edge' d='M900,1022 V1050 H650 V1080'/>
+              <path class='edge' d='M900,1022 V1050 H1150 V1080'/>
+              <text class='edge-lbl' x='760' y='1043'>yes (LLM failed)</text>
+              <text class='edge-lbl' x='1050' y='1043'>no (LLM returned)</text>
+
+              <!-- Nodes -->
+              <g class='n' transform='translate(800,20)'>
+                <rect width='200' height='42'/>
+                <text x='100' y='27' text-anchor='middle'>incoming hazard</text>
+              </g>
+              <g class='n' transform='translate(760,100)'>
+                <rect width='280' height='52'/>
+                <text x='140' y='22' text-anchor='middle'>sha256 match in catalogue?</text>
+                <text x='140' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>same file as a labelled photo?</text>
+              </g>
+
+              <!-- Known branch: catalog contradiction -->
+              <g class='n' transform='translate(180,210)'>
+                <rect width='240' height='52'/>
+                <text x='120' y='22' text-anchor='middle'>catalogue agrees?</text>
+                <text x='120' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>detector class in catalog labels?</text>
+              </g>
+              <g class='n leaf' transform='translate(50,420)'>
+                <rect width='200' height='42'/>
+                <text x='100' y='27' text-anchor='middle'>known_image</text>
+              </g>
+              <g class='n leaf' transform='translate(350,420)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>human_review</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>catalog_detector_contradiction</text>
+              </g>
+
+              <!-- New-photo branch: phash -->
+              <g class='n' transform='translate(1070,210)'>
+                <rect width='260' height='52'/>
+                <text x='130' y='22' text-anchor='middle'>phash class mismatch?</text>
+                <text x='130' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>neighbour label disagrees with detector</text>
+              </g>
+              <g class='n leaf' transform='translate(800,420)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>human_review</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>phash_class_mismatch floor</text>
+              </g>
+
+              <g class='n' transform='translate(1370,420)'>
+                <rect width='260' height='52'/>
+                <text x='130' y='22' text-anchor='middle'>evidence_declined?</text>
+                <text x='130' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>reporter: "no other photo"</text>
+              </g>
+              <g class='n leaf' transform='translate(1100,540)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>human_review</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>evidence_declined</text>
+              </g>
+
+              <g class='n' transform='translate(1570,540)'>
+                <rect width='260' height='52'/>
+                <text x='130' y='22' text-anchor='middle'>severity_signal?</text>
+                <text x='130' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>from area, lane, class, recurrence</text>
+              </g>
+
+              <!-- Severity leaves -->
+              <g class='n leaf' transform='translate(1330,740)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>human_review</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>severe / recurring</text>
+              </g>
+
+              <!-- Moderate: conf band split -->
+              <g class='n' transform='translate(1600,740)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>YOLO confidence?</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>low or high band</text>
+              </g>
+              <g class='n leaf' transform='translate(1520,850)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>needs_more_evidence</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>moderate + low conf</text>
+              </g>
+              <g class='n leaf' transform='translate(1700,850)'>
+                <rect width='160' height='52'/>
+                <text x='80' y='22' text-anchor='middle'>standard</text>
+                <text x='80' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>moderate + high conf</text>
+              </g>
+
+              <!-- Minor: conf band split -->
+              <g class='n' transform='translate(1880,740)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>YOLO confidence?</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>low or high band</text>
+              </g>
+              <g class='n leaf' transform='translate(1800,850)'>
+                <rect width='200' height='52'/>
+                <text x='100' y='22' text-anchor='middle'>needs_more_evidence</text>
+                <text x='100' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>minor + low conf</text>
+              </g>
+              <g class='n leaf' transform='translate(1980,850)'>
+                <rect width='160' height='52'/>
+                <text x='80' y='22' text-anchor='middle'>standard</text>
+                <text x='80' y='40' text-anchor='middle' font-size='10' fill='#6b7280'>minor + high conf</text>
+              </g>
+
+              <!-- Safety net -->
+              <g class='n' transform='translate(780,1020)'>
+                <rect width='240' height='42'/>
+                <text x='120' y='27' text-anchor='middle'>LLM failed?</text>
+              </g>
+              <g class='n leaf' transform='translate(550,1080)'>
+                <rect width='200' height='42'/>
+                <text x='100' y='27' text-anchor='middle'>fall back to rule tree</text>
+              </g>
+              <g class='n leaf' transform='translate(1050,1080)'>
+                <rect width='200' height='42'/>
+                <text x='100' y='27' text-anchor='middle'>keep agent verdict</text>
+              </g>
+            </svg>
+          </div>
+        </div>
+        """
         html_doc = (
             "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -3571,7 +5372,9 @@ def create_app() -> FastAPI:
             "<div class='d-empty'>Pick a case on the left.</div>"
             "</aside>"
             "</div></section>"
-            f"<section id='pane-timeline' class='tab-pane'>{timeline_html}</section>"
+            f"<section id='pane-agentvalue' class='tab-pane'>{agent_value_html}</section>"
+            f"<section id='pane-dclasses' class='tab-pane'>{d_classes_html}</section>"
+            f"<section id='pane-ruletree' class='tab-pane'>{rule_tree_html}</section>"
             f"<script>{script}</script>"
             "</body></html>"
         )
@@ -3654,7 +5457,7 @@ def create_app() -> FastAPI:
         now = time.time()
         try:
             rows = con.execute(
-                "SELECT id, class, agent_decision, agent_trace_json "
+                "SELECT id, class, agent_decision, agent_trace_json, agent_value_json "
                 "FROM hazards WHERE reported_at >= ?",
                 (now - hrs * 3600,),
             ).fetchall()
@@ -3666,6 +5469,486 @@ def create_app() -> FastAPI:
             "total_hazards": len(rows),
             "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             **aggregates,
+        }
+
+    _VALID_VERDICTS = {"agree", "disagree", "not_relevant"}
+    # Round 23 iter 5 (4.11.2026): a feedback row grades ONE axis. The
+    # hazard axis uses agree/disagree/not_relevant (did the agent
+    # identify the hazard?); the priority axis uses ok/too_low/too_high
+    # (was the agent's urgency level right?). The POST writes both the
+    # legacy `agree` flag and the new `kind`+`verdict`.
+    _VALID_PRIORITY_VERDICTS = {"ok", "too_low", "too_high"}
+
+    @app.get("/agent_feedback/by_hazard")
+    def get_agent_feedback_by_hazard(request: Request, window_hours: int = 24) -> dict:
+        """Round 23 iter 5 (4.11.2026): latest verdict per hazard FOR
+        EACH kind (hazard, priority). The digest JS reads this on page
+        load so a case the worker voted on - hazard side, priority side
+        or both - shows its latest marks and lets the worker change them.
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            hrs = max(1, min(720, int(window_hours)))
+        except (TypeError, ValueError):
+            hrs = 24
+        settings = get_settings()
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        con.row_factory = _sqlite3.Row
+        cutoff = time.time() - hrs * 3600
+        try:
+            rows = con.execute(
+                "WITH ranked AS ("
+                "  SELECT hazard_id, kind, verdict, agree, note, created_at, "
+                "         ROW_NUMBER() OVER (PARTITION BY hazard_id, kind ORDER BY created_at DESC) rn "
+                "  FROM agent_feedback WHERE created_at >= ?"
+                ") SELECT hazard_id, kind, verdict, agree, note, created_at "
+                "FROM ranked WHERE rn = 1",
+                (cutoff,),
+            ).fetchall()
+        finally:
+            con.close()
+        out: dict = {}
+        for r in rows:
+            v = (r["verdict"] or "").strip().lower() if "verdict" in r.keys() else ""
+            if not v:
+                v = "agree" if r["agree"] else "disagree"
+            k = (r["kind"] or "hazard").strip().lower() if "kind" in r.keys() else "hazard"
+            entry = out.setdefault(r["hazard_id"], {})
+            entry[k] = {"verdict": v, "note": r["note"] or "", "at": r["created_at"]}
+        return {"window_hours": hrs, "by_hazard": out}
+
+    @app.post("/agent_feedback/{hazard_id}")
+    def post_agent_feedback(hazard_id: str, body: dict, request: Request) -> dict:
+        """Round 23 (4.11.2026): the worker's three-state verdict on the
+        agent's call for one hazard. Writes one row to agent_feedback
+        and returns the running tally for this hazard. Private: gated to
+        Tailscale / loopback like the digest page that calls it.
+        Body: {"verdict": "agree" | "disagree" | "not_relevant",
+               "note": str?}.
+        For back-compat an older client that still sends {"agree": bool}
+        is accepted (true -> agree, false -> disagree).
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        verdict = str(body.get("verdict") or "").strip().lower()
+        kind = str(body.get("kind") or "hazard").strip().lower()
+        if kind not in {"hazard", "priority"}:
+            raise HTTPException(status_code=400,
+                                detail="kind_must_be_hazard_or_priority")
+        if not verdict:
+            # back-compat: {"agree": true/false} is always hazard
+            if "agree" in body:
+                verdict = "agree" if bool(body.get("agree")) else "disagree"
+                kind = "hazard"
+        valid = _VALID_VERDICTS if kind == "hazard" else _VALID_PRIORITY_VERDICTS
+        if verdict not in valid:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"verdict_must_be_one_of_{'_'.join(sorted(valid))}")
+            )
+        note = str(body.get("note") or "")[:400]
+        import sqlite3 as _sqlite3
+        import uuid as _uuid
+        settings = get_settings()
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        con.row_factory = _sqlite3.Row
+        try:
+            fid = "fb_" + _uuid.uuid4().hex[:12]
+            con.execute(
+                "INSERT INTO agent_feedback (id, hazard_id, created_at, worker_id, agree, verdict, note, kind) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (fid, hazard_id, time.time(), "", 1 if verdict == "agree" else 0, verdict, note, kind),
+            )
+            con.commit()
+            row = con.execute(
+                "SELECT "
+                "  SUM(CASE WHEN kind='hazard' AND verdict='agree' THEN 1 ELSE 0 END) AS haz_agree, "
+                "  SUM(CASE WHEN kind='hazard' AND verdict='disagree' THEN 1 ELSE 0 END) AS haz_disagree, "
+                "  SUM(CASE WHEN kind='hazard' AND verdict='not_relevant' THEN 1 ELSE 0 END) AS haz_nr, "
+                "  SUM(CASE WHEN kind='priority' AND verdict='ok' THEN 1 ELSE 0 END) AS pri_ok, "
+                "  SUM(CASE WHEN kind='priority' AND verdict='too_low' THEN 1 ELSE 0 END) AS pri_lo, "
+                "  SUM(CASE WHEN kind='priority' AND verdict='too_high' THEN 1 ELSE 0 END) AS pri_hi, "
+                "  COUNT(*) AS total "
+                "FROM agent_feedback WHERE hazard_id = ?",
+                (hazard_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        return {
+            "id": fid,
+            "hazard_id": hazard_id,
+            "kind": kind,
+            "verdict": verdict,
+            "hazard": {
+                "agree": int(row["haz_agree"] or 0),
+                "disagree": int(row["haz_disagree"] or 0),
+                "not_relevant": int(row["haz_nr"] or 0),
+            },
+            "priority": {
+                "ok": int(row["pri_ok"] or 0),
+                "too_low": int(row["pri_lo"] or 0),
+                "too_high": int(row["pri_hi"] or 0),
+            },
+            "feedback_total": int(row["total"] or 0),
+        }
+
+    @app.get("/stats/feedback")
+    def stats_feedback(request: Request, window_hours: int = 24) -> dict:
+        """Round 23 (4.11.2026) iter 3: aggregate the worker's verdicts
+        by DISTINCT HAZARD, not by click count. A hazard the worker
+        clicked three times (Disagree -> Agree -> Not relevant) is
+        counted once, with its LATEST verdict. The 'Agent value' tab's
+        counters therefore read as 'how many cases the worker labeled
+        X', which is what the owner asked for.
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            hrs = max(1, min(720, int(window_hours)))
+        except (TypeError, ValueError):
+            hrs = 24
+        settings = get_settings()
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        con.row_factory = _sqlite3.Row
+        cutoff = time.time() - hrs * 3600
+        try:
+            # Round 23 iter 5: latest row per (hazard, kind). Hazard and
+            # priority are counted on their own axes.
+            rows = con.execute(
+                "WITH ranked AS ("
+                "  SELECT f.hazard_id, f.kind, f.agree, f.verdict, f.note, f.created_at, "
+                "         h.class, h.agent_decision, "
+                "         ROW_NUMBER() OVER (PARTITION BY f.hazard_id, f.kind ORDER BY f.created_at DESC) rn "
+                "  FROM agent_feedback f "
+                "  LEFT JOIN hazards h ON h.id = f.hazard_id "
+                "  WHERE f.created_at >= ?"
+                ") SELECT hazard_id, kind, agree, verdict, note, class, agent_decision "
+                "FROM ranked WHERE rn = 1 "
+                "ORDER BY hazard_id",
+                (cutoff,),
+            ).fetchall()
+        finally:
+            con.close()
+        def _verdict(r) -> str:
+            v = str(r["verdict"] or "").strip().lower() if "verdict" in r.keys() else ""
+            if v:
+                return v
+            return "agree" if r["agree"] else "disagree"
+        hazard_counters = {"agree": 0, "disagree": 0, "not_relevant": 0}
+        priority_counters = {"ok": 0, "too_low": 0, "too_high": 0}
+        hazard_cases = set()
+        priority_cases = set()
+        disagrees: list[dict] = []
+        not_relevant: list[dict] = []
+        pri_wrong: list[dict] = []
+        for r in rows:
+            v = _verdict(r)
+            kind = (r["kind"] or "hazard").strip().lower() if "kind" in r.keys() else "hazard"
+            if kind == "hazard":
+                hazard_cases.add(r["hazard_id"])
+                hazard_counters[v] = hazard_counters.get(v, 0) + 1
+                if v == "disagree":
+                    disagrees.append({"hazard_id": r["hazard_id"], "class": r["class"],
+                                      "decision": r["agent_decision"], "note": r["note"]})
+                elif v == "not_relevant":
+                    not_relevant.append({"hazard_id": r["hazard_id"], "class": r["class"],
+                                         "decision": r["agent_decision"], "note": r["note"]})
+            else:
+                priority_cases.add(r["hazard_id"])
+                priority_counters[v] = priority_counters.get(v, 0) + 1
+                if v != "ok":
+                    pri_wrong.append({"hazard_id": r["hazard_id"], "class": r["class"],
+                                      "decision": r["agent_decision"], "note": r["note"], "verdict": v})
+        return {
+            "window_hours": hrs,
+            "hazard": {
+                "total_cases_voted": len(hazard_cases),
+                "agree": hazard_counters["agree"],
+                "disagree": hazard_counters["disagree"],
+                "not_relevant": hazard_counters["not_relevant"],
+                "agreement_rate": round(100.0 * hazard_counters["agree"] / len(hazard_cases), 1) if hazard_cases else 0.0,
+            },
+            "priority": {
+                "total_cases_voted": len(priority_cases),
+                "ok": priority_counters["ok"],
+                "too_low": priority_counters["too_low"],
+                "too_high": priority_counters["too_high"],
+                "agreement_rate": round(100.0 * priority_counters["ok"] / len(priority_cases), 1) if priority_cases else 0.0,
+            },
+            "disagrees": disagrees,
+            "not_relevants": not_relevant,
+            "priority_wrong": pri_wrong,
+        }
+
+    _CATALOG_IMAGE_ROOT = "/var/lib/roadguard/dataset/extracted/road_damage_detect"
+
+    @app.get("/catalog_image/{pic_id}")
+    def catalog_image(pic_id: int, request: Request):
+        """Round 23 iter 5 (4.11.2026): serve one image from the labelled
+        catalog so the D Classes tab can show reference exemplars next
+        to the worker's live Cases. Private host only, same as the rest
+        of the operator surface.
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        from pathlib import Path as _Path
+        from fastapi.responses import FileResponse as _FileResponse
+        settings = get_settings()
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        try:
+            row = con.execute(
+                "SELECT rel_path FROM dataset_images WHERE pic_id = ?",
+                (int(pic_id),),
+            ).fetchone()
+        finally:
+            con.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="catalog_image_not_found")
+        p = _Path(_CATALOG_IMAGE_ROOT) / row[0]
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail="catalog_image_file_missing")
+        return _FileResponse(str(p), media_type="image/jpeg")
+
+    @app.get("/stats/ds_metrics")
+    def stats_ds_metrics(request: Request, window_hours: int = 24) -> dict:
+        """Round 26 (5.11.2026): the 20 data-science metrics the owner
+        asked for, all computed from in-system state (hazards +
+        agent_feedback). Returns feedback-agreement, uplift, extended
+        cost, justified histogram, confusion matrix, per-class precision,
+        ROC-AUC and grounding score. A metric that lacks enough feedback
+        is returned as null with a side n= count, so the UI shows
+        'pending feedback' rather than a misleading zero.
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            hrs = max(1, min(720, int(window_hours)))
+        except (TypeError, ValueError):
+            hrs = 24
+        settings = get_settings()
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        con.row_factory = _sqlite3.Row
+        cutoff = time.time() - hrs * 3600
+        try:
+            hazard_rows = con.execute(
+                "SELECT id, class, confidence, priority, agent_decision, "
+                "       agent_value_json, agent_trace_json "
+                "  FROM hazards WHERE id LIKE 'hz_%' AND reported_at >= ?",
+                (cutoff,),
+            ).fetchall()
+            fb_rows = con.execute(
+                "WITH ranked AS ("
+                "  SELECT hazard_id, kind, verdict, agree, created_at, "
+                "         ROW_NUMBER() OVER (PARTITION BY hazard_id, kind ORDER BY created_at DESC) rn "
+                "  FROM agent_feedback WHERE created_at >= ?"
+                ") SELECT hazard_id, kind, verdict, agree "
+                "FROM ranked WHERE rn = 1",
+                (cutoff,),
+            ).fetchall()
+        finally:
+            con.close()
+        block = _compute_ds_metrics_block(hazard_rows, fb_rows)
+        block["window_hours"] = hrs
+        return block
+
+    @app.get("/stats/kpi")
+    def stats_kpi(request: Request, window_hours: int = 24) -> dict:
+        """Round 23 (4.11.2026): live KPI board matching the presentation's
+        targets table. Returns the four KPIs - rule_tree_agreement,
+        grounded_citations, rag_relevance, median_latency - each with its
+        target, current value, pass/fail flag and a plain-language reason.
+        Private: gated to Tailscale / loopback like /digest and /stats/
+        agents. The /flow page, the /digest KPI strip and the deck all
+        read this one source.
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            hrs = max(1, min(720, int(window_hours)))
+        except (TypeError, ValueError):
+            hrs = 24
+        settings = get_settings()
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        con.row_factory = _sqlite3.Row
+        now = time.time()
+        try:
+            rows = con.execute(
+                "SELECT id, class, agent_decision, agent_trace_json, agent_value_json "
+                "FROM hazards WHERE reported_at >= ?",
+                (now - hrs * 3600,),
+            ).fetchall()
+        finally:
+            con.close()
+        n = len(rows)
+        if n == 0:
+            return {"window_hours": hrs, "total_hazards": 0, "kpis": []}
+        # Correct action: without ground truth, read as "agreement with
+        # the deterministic rule tree". When expected_verdicts.csv is
+        # filled the computation moves to that ground truth.
+        rule_tree_eq_final = 0
+        grounded = 0
+        decision_llm_runs = 0
+        direct_match_runs = 0
+        rag_total_runs = 0
+        latencies: list[float] = []
+        for r in rows:
+            try:
+                av = json.loads((r["agent_value_json"] if r["agent_value_json"] else "") or "{}")
+            except (TypeError, ValueError):
+                av = {}
+            if av.get("rule_tree_action") == av.get("final_action"):
+                rule_tree_eq_final += 1
+            try:
+                trace = json.loads(r["agent_trace_json"] or "[]")
+            except (TypeError, ValueError):
+                trace = []
+            case_latency = 0.0
+            stamps = []
+            for e in trace:
+                if not isinstance(e, dict):
+                    continue
+                if e.get("ts"):
+                    try:
+                        stamps.append(float(e["ts"]))
+                    except (TypeError, ValueError):
+                        pass
+                c = e.get("content") if isinstance(e.get("content"), dict) else None
+                if not c:
+                    continue
+                if e.get("speaker") == "decision" and e.get("kind") == "final":
+                    if c.get("source") == "llm_react":
+                        decision_llm_runs += 1
+                        rc = c.get("rationale_check") if isinstance(c.get("rationale_check"), dict) else {}
+                        if rc.get("ok") and (c.get("cited_sources") or []):
+                            grounded += 1
+                if e.get("speaker") == "rag_retriever":
+                    rag_total_runs += 1
+                    if c.get("coverage") == "direct_match":
+                        direct_match_runs += 1
+            if len(stamps) >= 2:
+                case_latency = max(stamps) - min(stamps)
+            if case_latency > 0:
+                latencies.append(case_latency)
+        median_lat = (sorted(latencies)[len(latencies) // 2] if latencies else 0.0)
+        kpis = [
+            {
+                # Round 29 (6.11.2026 audit F15): named for what it measures;
+                # there is no ground truth behind it.
+                "key": "rule_tree_agreement",
+                "label": "Agreement with rule tree (not accuracy)",
+                "target_pct": 85,
+                "value_pct": round(100.0 * rule_tree_eq_final / max(1, n), 1),
+                "numerator": rule_tree_eq_final,
+                "denominator": n,
+                "status": "ok" if (rule_tree_eq_final / max(1, n)) >= 0.85 else "fail",
+                "note": "agreement with the deterministic tree, not accuracy: accuracy is measured from the supervisor feedback (agent_feedback, /stats/feedback)",
+            },
+            {
+                "key": "grounded_citations",
+                "label": "Grounded LLM citations",
+                "target_pct": 90,
+                "value_pct": round(100.0 * grounded / max(1, decision_llm_runs), 1) if decision_llm_runs else 0.0,
+                "numerator": grounded,
+                "denominator": decision_llm_runs,
+                "status": "ok" if (decision_llm_runs and grounded / decision_llm_runs >= 0.90) else "fail",
+                "note": "share of Decision LLM runs that passed rationale_check with cited sources",
+            },
+            {
+                "key": "rag_relevance",
+                "label": "RAG direct match",
+                "target_pct": 95,
+                "value_pct": round(100.0 * direct_match_runs / max(1, rag_total_runs), 1) if rag_total_runs else 0.0,
+                "numerator": direct_match_runs,
+                "denominator": rag_total_runs,
+                "status": "ok" if (rag_total_runs and direct_match_runs / rag_total_runs >= 0.95) else "fail",
+                "note": "share of RAG runs that returned a direct topic match for the hazard class",
+            },
+            {
+                "key": "median_latency_s",
+                "label": "Median latency (s)",
+                "target_pct": 360,  # a seconds cap, not a percent
+                "value_pct": round(median_lat, 1),
+                "numerator": 0,
+                "denominator": 0,
+                "status": "ok" if median_lat <= 360 else "fail",
+                "note": "wall seconds per case; cap 360s",
+            },
+        ]
+        return {"window_hours": hrs, "total_hazards": n, "kpis": kpis}
+
+    @app.get("/stats/advantage")
+    def stats_advantage(request: Request, window_hours: int = 24) -> dict:
+        """Round 23 (4.11.2026): cases where the agent outperformed the
+        deterministic rule tree OR the human (deny on approval). Returns
+        two lists the /flow page and the deck case-study slides read.
+        Private, like the other /stats endpoints.
+        """
+        if not _is_private_host(request):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            hrs = max(1, min(720, int(window_hours)))
+        except (TypeError, ValueError):
+            hrs = 24
+        settings = get_settings()
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(settings.roadguard_db_path)
+        con.row_factory = _sqlite3.Row
+        now = time.time()
+        try:
+            rows = con.execute(
+                "SELECT h.id, h.class, h.agent_decision, h.agent_value_json, "
+                "       h.reported_at, h.priority, "
+                "       a.status AS approval_status, a.note AS approval_note, a.decided_at "
+                "FROM hazards h "
+                "LEFT JOIN approvals a ON a.hazard_id = h.id "
+                "WHERE h.reported_at >= ? "
+                "ORDER BY h.reported_at DESC",
+                (now - hrs * 3600,),
+            ).fetchall()
+        finally:
+            con.close()
+        vs_tree: list[dict] = []
+        vs_human_approved: list[dict] = []
+        vs_human_denied: list[dict] = []
+        for r in rows:
+            try:
+                av = json.loads((r["agent_value_json"] if r["agent_value_json"] else "") or "{}")
+            except (TypeError, ValueError):
+                av = {}
+            if not isinstance(av, dict):
+                continue
+            if av.get("changed_rule_hint"):
+                vs_tree.append({
+                    "id": r["id"], "class": r["class"], "decision": r["agent_decision"],
+                    "rule_tree_action": av.get("rule_tree_action"),
+                    "final_action": av.get("final_action"),
+                    "profile_llm_changed": av.get("profile_llm_changed"),
+                    "research_llm_changed": av.get("research_llm_changed"),
+                    "reported_at": r["reported_at"],
+                })
+            status = (r["approval_status"] if hasattr(r, "__getitem__") else getattr(r, "approval_status", None)) or ""
+            if status == "approved":
+                vs_human_approved.append({
+                    "id": r["id"], "class": r["class"], "decision": r["agent_decision"],
+                    "note": r["approval_note"], "decided_at": r["decided_at"],
+                })
+            elif status == "denied":
+                vs_human_denied.append({
+                    "id": r["id"], "class": r["class"], "decision": r["agent_decision"],
+                    "note": r["approval_note"], "decided_at": r["decided_at"],
+                })
+        return {
+            "window_hours": hrs,
+            "total_hazards": len(rows),
+            "advantage_over_tree": vs_tree,
+            "agent_approved_by_human": vs_human_approved,
+            "agent_corrected_by_human": vs_human_denied,
         }
 
     @app.get("/digest/latest", response_class=HTMLResponse)
@@ -4140,6 +6423,9 @@ def create_app() -> FastAPI:
             agent_trace_json="[]",
             status="queued",
             work_order_id=None,
+            # 6.11.2026 audit F11: the citizen's description was kept only
+            # inside the trace; the supervisor pages read this column.
+            reporter_text=sanitize_reporter_text(body.reporter_text or "")["text"],
         ))
         background.add_task(
             _run_graph_and_persist,
@@ -4425,6 +6711,7 @@ def create_app() -> FastAPI:
                 "priority": r.priority,
                 "status": r.status,
                 "assessment": r.agent_assessment or "",
+                "interrupted": _trace_has_event(trace, "graph_interrupted"),
             },
             "evidence_request": evidence_request,
             "grounded_sources": cited,
@@ -4451,12 +6738,23 @@ def create_app() -> FastAPI:
 
     @app.get("/report")
     def report_recent(
+        request: Request,
         user: dict[str, Any] = Depends(get_current_user),
         db=Depends(get_db),
     ) -> dict:
-        """Operator overview: last 50 hazards for this user, counts by
-        action and class, pending approvals and evidence requests."""
-        rows = db.list_user_hazards(_user_id_of(user), limit=50)
+        """Operator overview: counts by action and class, pending approvals
+        and evidence requests. Round 29 (6.11.2026 audit F15): on a private
+        operator host the counts cover the fleet's last 24 hours, the same
+        population the pending list is drawn from (the supervisor page said
+        "Total: 0" next to 43 pending approvals); the per-user last 50 stay
+        for the citizen API."""
+        window_hours: int | None = None
+        if _is_private_host(request):
+            window_hours = 24
+            cutoff = time.time() - window_hours * 3600
+            rows = [r for r in db.list_recent_hazards(limit=500) if float(r.reported_at or 0) >= cutoff]
+        else:
+            rows = db.list_user_hazards(_user_id_of(user), limit=50)
         by_action: dict[str, int] = {}
         by_class: dict[str, int] = {}
         for r in rows:
@@ -4470,6 +6768,7 @@ def create_app() -> FastAPI:
         now = time.time()
         return {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "window_hours": window_hours,
             "total_hazards": len(rows),
             "by_action": by_action,
             "by_class": by_class,

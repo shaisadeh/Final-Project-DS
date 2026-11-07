@@ -3,7 +3,7 @@
 # executive summary (headline + supervisor denials + Patterns block +
 # decision-support footer); the per-case detail (one block per hazard
 # with rationale, pipeline, cited sources, status) ships as an attached
-# PDF built with ReportLab's SimpleDocTemplate (streaming flowables -
+# PDF generated with ReportLab's SimpleDocTemplate (streaming flowables -
 # memory-efficient; fpdf2 was blowing past 9 GB on 60+ cases).
 #
 # Both are written to /var/lib/roadguard/digests/<date>.{html,pdf}; the

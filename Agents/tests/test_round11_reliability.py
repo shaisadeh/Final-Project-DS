@@ -49,17 +49,22 @@ def _run_worker(monkeypatch, replies, registry):
     return out, seen
 
 
-def test_worker_reply_sent_as_a_tool_call_is_used_as_the_reply(monkeypatch):
+def test_worker_reply_sent_as_a_tool_call_through_a_lookup_tool_is_the_reply(monkeypatch):
+    """Round 18 (2.11.2026) rejected a final JSON riding a lookup tool call
+    and asked again; round 29 (6.11.2026 audit F6) uses the worker's own
+    reply as the reply at once (the retry threw it away in r23) and still
+    runs nothing with the reply as arguments."""
     record = []
     reply = {"severity_signal": "severe", "severity_rationale": "D40 pothole", "confidence": "high",
              "needs_more_evidence": False, "missing_fields": [], "tools_used": ["inspect_image_quality"]}
-    (parsed, _, _, info), seen = _run_worker(monkeypatch, [_msg(tool_calls=[_call("lookup_similar_cases", reply)])], _registry(record))
+    replies = [
+        _msg(tool_calls=[_call("lookup_similar_cases", reply)]),
+    ]
+    (parsed, _, _, info), seen = _run_worker(monkeypatch, replies, _registry(record))
     assert parsed == reply and len(seen) == 1
     assert record == [], "nothing may run with the reply as arguments"
-    assert info["final_in_tool_call"] is True and info["hops"] == 0
-    # Round 16: the reply in a tool envelope is a reply, not an executed (failed) tool.
-    assert info["calls"][0]["ok"] is False and info["calls"][0]["executed"] is False
-    assert info["calls"][0]["reply_in_tool_call"] is True
+    first = info["calls"][0]
+    assert first["ok"] is False and first.get("reply_in_tool_call") is True
 
 
 def test_worker_tool_arguments_are_validated_and_unknown_keys_dropped(monkeypatch):
@@ -160,16 +165,19 @@ def test_deterministic_rationale_is_built_from_the_inputs():
 
 
 def test_trace_lines_show_the_rationale_check():
+    """Round 21 (3.11.2026): the operator trace shows the FAIL line and the
+    deterministic sentence, but no longer the rejected model text (kept on
+    rationale_check.model_rationale / model_assessment for the audit only)."""
     failed = {"speaker": "decision", "kind": "final", "content": {
         "action": "standard", "priority": 45, "source": "llm_react", "rationale": "routine repair queue for D40 ...", "cited_sources": [],
         "rationale_check": {"ok": False, "problems": ["reporter_claims_without_text"], "model_rationale": "The reporter's claims are consistent"}}}
     text = "\n".join(ra._entry_lines(failed, []))
-    assert "rationale check: FAIL (reporter_claims_without_text); deterministic sentence shown" in text
-    assert "model rationale: The reporter's claims are consistent" in text
+    assert "rationale check: FAIL (reporter_claims_without_text); deterministic sentence shown (model text kept on rationale_check for the audit)" in text
+    assert "model rationale:" not in text
     both = {"speaker": "decision", "kind": "final", "content": {
         "action": "standard", "priority": 45, "source": "llm_react", "rationale": "deterministic", "cited_sources": [],
         "rationale_check": {"ok": False, "problems": ["reporter_claims_without_text"], "model_assessment": "The reporter's claims are unverified"}}}
-    assert "model assessment: The reporter's claims are unverified" in "\n".join(ra._entry_lines(both, []))
+    assert "model assessment:" not in "\n".join(ra._entry_lines(both, []))
     ok = {"speaker": "decision", "kind": "final", "content": {"action": "standard", "priority": 45, "source": "llm_react",
                                                               "rationale": "fine", "cited_sources": [], "rationale_check": {"ok": True, "problems": []}}}
     assert "rationale check: ok" in "\n".join(ra._entry_lines(ok, []))

@@ -16,7 +16,11 @@ def _call(name, args, call_id="c1"):
     return {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}
 
 
-def test_worker_reply_in_a_tool_envelope_is_a_reply_not_a_failed_tool(monkeypatch):
+def test_worker_reply_through_a_lookup_tool_is_the_reply(monkeypatch):
+    """Round 18 (2.11.2026) retried a final answer that rode a lookup tool;
+    round 29 (6.11.2026 audit F6) uses the worker's own reply as the reply
+    (reply_in_tool_call, the round 16 label), nothing runs, and the autonomy
+    record does not count it as a failed tool."""
     ran = []
 
     def similar(location: str, hazard_class: str, state: dict | None = None) -> dict:
@@ -24,24 +28,21 @@ def test_worker_reply_in_a_tool_envelope_is_a_reply_not_a_failed_tool(monkeypatc
         return {"ok": True, "count": 0, "cases": [], "is_recurring_location": False}
 
     registry = {"lookup_similar_cases": (similar, ra.PERCEPTION_WORKER_TOOLS["lookup_similar_cases"][1])}
-    reply = {"severity_signal": "minor", "severity_rationale": "D40", "confidence": "low", "needs_more_evidence": False, "missing_fields": []}
-    monkeypatch.setattr(ra, "chat", lambda messages, tools=None, temperature=0.0, use_panel=False, provider_override=None, **kw: (_msg(tool_calls=[_call("lookup_similar_cases", reply)]), 10, 5))
+    reply = {"severity_signal": "minor", "severity_rationale": "D40", "confidence": "low",
+             "needs_more_evidence": False, "missing_fields": []}
+    replies = iter([
+        _msg(tool_calls=[_call("lookup_similar_cases", reply)]),
+    ])
+    monkeypatch.setattr(ra, "chat", lambda messages, tools=None, temperature=0.0, use_panel=False, provider_override=None, **kw: (next(replies), 10, 5))
     parsed, _, _, info = ra._llm_react_worker(
         agent_name="profile_builder", system_prompt="s", user_payload={}, tool_registry=registry,
         state={"hazard_id": "hz_t", "metadata": {}}, provider_override=None, max_hops=2, time_cap_s=90.0,
     )
     assert parsed == reply and ran == []
-    call = info["calls"][0]
-    assert call["executed"] is False and call["reply_in_tool_call"] is True
-    assert info["steps"][0]["content"]["reply_in_tool_call"] is True
-    assert isinstance(info["time_used_s"], float) and info["time_cap_s"] == 90.0
+    first = info["calls"][0]
+    assert first["ok"] is False and first.get("reply_in_tool_call") is True
     rec = ra._autonomy_record(parsed, info, required=("inspect_image_quality",))
-    assert rec["failed_tools"] == [] and "tool_call_failed:lookup_similar_cases" not in rec["violations"]
-    assert rec["final_in_tool_call"] is True and rec["time_cap_s"] == 90.0 and rec["cut_by_cap"] is False
-    step_text = "\n".join(ra._entry_lines(info["steps"][0], []))
-    assert "status: reply (JSON arrived as a tool call; used as the agent's reply, no tool ran)" in step_text
-    assert "error:" not in step_text and "failed" not in step_text
-
+    assert "tool_call_failed:lookup_similar_cases" not in rec["violations"]
 
 def test_result_lines_carry_tool_failures_and_reply_via():
     prof = {"speaker": "profile_builder", "kind": "handoff_out", "content": {
@@ -53,7 +54,7 @@ def test_result_lines_carry_tool_failures_and_reply_via():
     lines = ra._entry_lines(prof, [])
     assert lines[0].endswith("llm_used=True  tool_failures=1  reply_via=tool_call")
     auto = [l for l in lines if "autonomy:" in l][0]
-    assert "agent_called=inspect_image_quality  hops=2  failed=recall_agent_notes  reply_via=tool_call  time=44s/90s  violations=tool_call_failed:recall_agent_notes" in auto
+    assert "agent_called=inspect_image_quality  hops=2  failed=recall_agent_notes  reply_via=tool_call  time=44s/90s  source=agent_choice  violations=tool_call_failed:recall_agent_notes" in auto
     assert "tools=" not in auto
 
     cut = {"speaker": "rag_retriever", "kind": "handoff_out", "content": {
@@ -62,9 +63,12 @@ def test_result_lines_carry_tool_failures_and_reply_via():
         "autonomy": {"tools_used": [], "hops": 0, "auto_ran": ["query_repair_standards"], "fallback": "deterministic_query (3 passages)",
                      "time_used_s": 90.4, "time_cap_s": 90.0, "cut_by_cap": True, "violations": ["required_not_called:query_repair_standards", "time_cap"]}}}
     lines2 = ra._entry_lines(cut, ["a1"])
-    assert "coverage=direct_match  answers=repair_window,traffic_control  missing=urgency,safety_risk  llm_used=True" in lines2[0]
+    # Round 19: the RAG line now shows topic/sufficient apart (direct_match
+    # is the topic axis; sufficient reflects whether the questions are answered).
+    assert "topic=direct_match  sufficient=no  answers=repair_window,traffic_control  missing=urgency,safety_risk  llm_used=True" in lines2[0]
     auto2 = [l for l in lines2 if "autonomy:" in l][0]
-    assert "agent_called=none  hops=0  auto_ran=query_repair_standards  fallback=deterministic_query (3 passages)  time=90s/90s (cut by cap)  violations=" in auto2
+    # Round 20: auto_ran without an agent-called hop prints source=deterministic_fallback.
+    assert "agent_called=none  hops=0  auto_ran=query_repair_standards  fallback=deterministic_query (3 passages)  time=90s/90s (cut by cap)  source=deterministic_fallback  violations=" in auto2
 
     dec = {"speaker": "decision", "kind": "final", "content": {
         "action": "standard", "priority": 45, "source": "llm_react", "rationale": "r", "cited_sources": [],

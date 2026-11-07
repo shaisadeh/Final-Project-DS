@@ -124,6 +124,7 @@ def get_settings() -> Settings:
 def reset_settings_cache() -> None:
     """Clear the lru_cache so tests can override environment between runs."""
     get_settings.cache_clear()
+    _RETRIEVAL_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,7 @@ CREATE TABLE IF NOT EXISTS hazards (
     cited_sources_json  TEXT NOT NULL DEFAULT '[]',
     reporter_text       TEXT NOT NULL DEFAULT '',   -- free text typed by the reporter; the API stores the sanitised copy, never the raw text
     agent_assessment    TEXT NOT NULL DEFAULT '',   -- Decision model text for the supervisor (labelled as such); never sent to the reporter
+    agent_value_json    TEXT NOT NULL DEFAULT '',   -- round 22 (4.11.2026): compact per-case 'did the agent change what the rule tree would have said' summary read by /stats/agents and the trace footer
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -474,6 +476,24 @@ CREATE TABLE IF NOT EXISTS agent_notes (
 
 CREATE INDEX IF NOT EXISTS idx_agent_notes_case
     ON agent_notes(hazard_class, road_type, created_at DESC);
+
+-- Round 23 (4.11.2026): worker verdict on the agent's call per hazard.
+-- One row per worker click on "Agree with agent" / "Override agent" in
+-- the digest; the aggregate is what the /digest "Agent value" tab shows
+-- as a worker-agreement rate next to the rule-tree-agreement number. No
+-- foreign key: a feedback can land before the hazard row is persisted
+-- (the worker may click on a case still processing).
+CREATE TABLE IF NOT EXISTS agent_feedback (
+    id          TEXT PRIMARY KEY,
+    hazard_id   TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    worker_id   TEXT NOT NULL DEFAULT '',
+    agree       INTEGER NOT NULL,         -- 1 = worker agrees, 0 = worker overrides
+    note        TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_feedback_hazard
+    ON agent_feedback(hazard_id, created_at DESC);
 
 -- Persistent DecisionCache (live-drive flow). Each row is a (key -> verdict)
 -- entry with an expiry wall-clock. The server reads unexpired rows into
@@ -587,6 +607,7 @@ class Hazard:
     cited_sources_json: str = "[]"
     reporter_text: str = ""
     agent_assessment: str = ""
+    agent_value_json: str = ""   # round 22 (4.11.2026): see _build_agent_value_summary
 
 
 @dataclass
@@ -669,6 +690,22 @@ class Database:
         ("users", "google_sub", "TEXT"),
         ("users", "is_admin", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "is_internal", "INTEGER NOT NULL DEFAULT 0"),
+        # Round 22 (4.11.2026): agent value per case - a flat column with
+        # rule_tree_action / llm_action / final_action and change flags,
+        # so SELECT COUNT(*) WHERE json_extract(agent_value_json, '$.changed_rule_hint') = 1
+        # answers "how often did the LLM change the rule tree's verdict" in one hop.
+        ("hazards", "agent_value_json", "TEXT NOT NULL DEFAULT ''"),
+        # Round 23 (4.11.2026): the worker's feedback is 3-state (agree /
+        # disagree / not_relevant) not a boolean; add the text column
+        # that carries that verdict, keep the old `agree` column for
+        # back-compat.
+        ("agent_feedback", "verdict", "TEXT NOT NULL DEFAULT ''"),
+        # Round 23 iter 5 (4.11.2026): a row grades ONE axis of the
+        # agent's call. kind='hazard' for the identification vote
+        # (agree/disagree/not_relevant), kind='priority' for the
+        # urgency vote (ok/too_low/too_high). The default stays 'hazard'
+        # so older rows continue to read as hazard feedback.
+        ("agent_feedback", "kind", "TEXT NOT NULL DEFAULT 'hazard'"),
     )
 
     def _migrate_columns(self) -> None:
@@ -825,6 +862,11 @@ class Database:
     # ----- Hazards ---------------------------------------------------------
 
     def create_hazard(self, hazard: Hazard) -> None:
+        # Round 22 (4.11.2026): if the caller did not pre-compute
+        # agent_value_json we derive it from the stored trace so the DB
+        # column is populated for every row written to hazards, old code
+        # paths included (eval scripts, replays).
+        av = hazard.agent_value_json or _build_agent_value_summary_json(hazard.agent_trace_json)
         self._conn.execute(
             """
             INSERT INTO hazards (
@@ -832,8 +874,8 @@ class Database:
                 lane_blocked, location, bboxes_json,
                 priority, agent_decision, agent_rationale,
                 agent_trace_json, status, work_order_id, cited_sources_json,
-                reporter_text, agent_assessment
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reporter_text, agent_assessment, agent_value_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 hazard.id,
@@ -854,6 +896,7 @@ class Database:
                 hazard.cited_sources_json,
                 hazard.reporter_text or "",
                 hazard.agent_assessment or "",
+                av,
             ),
         )
 
@@ -869,16 +912,22 @@ class Database:
         status: str,
         work_order_id: str | None,
         agent_assessment: str = "",
+        agent_value_json: str | None = None,
     ) -> bool:
         """Overwrite the verdict columns after a resumed run (evidence
         round trip). Returns True when the row existed."""
+        # Round 22 (4.11.2026): derive from the final trace when the caller
+        # did not pre-compute it, so an update that resets the verdict also
+        # refreshes the queryable agent_value column.
+        av = agent_value_json if agent_value_json is not None else _build_agent_value_summary_json(agent_trace_json)
         cur = self._conn.execute(
             """
             UPDATE hazards
                SET priority = ?, agent_decision = ?, agent_rationale = ?,
                    agent_trace_json = ?, cited_sources_json = ?, status = ?,
                    work_order_id = COALESCE(?, work_order_id),
-                   agent_assessment = ?
+                   agent_assessment = ?,
+                   agent_value_json = ?
              WHERE id = ?
             """,
             (
@@ -890,6 +939,7 @@ class Database:
                 status,
                 work_order_id,
                 agent_assessment or "",
+                av,
                 hazard_id,
             ),
         )
@@ -1634,6 +1684,7 @@ class Database:
             cited_sources_json=row["cited_sources_json"] or "[]",
             reporter_text=row["reporter_text"] or "",
             agent_assessment=row["agent_assessment"] or "",
+            agent_value_json=(row["agent_value_json"] if "agent_value_json" in row.keys() else "") or "",
         )
 
 
@@ -1820,6 +1871,11 @@ class RoadGuardState(TypedDict, total=False):
     # Round 17: the reporter re-sent the original photo with a note (no
     # other photo); the case goes to a human without a second model pass.
     evidence_declined: bool
+    # Round 29 (6.11.2026 audit F12): sanitize already knows the verdict is
+    # fixed by the catalogue (a sealed sha256 match, or a phash neighbour
+    # inside the floor radius whose labels disagree with the detector); the
+    # workers run their rule paths and skip their LLM passes.
+    deterministic_workers_reason: str | None
 
 
 def initial_state(
@@ -3585,6 +3641,37 @@ _WORKER_FINAL_KEYS = {
 }
 
 
+# Round 18 (2.11.2026): read-only tool names a worker may call. A reply
+# shape coming through one of these is clearly a misroute, not a final
+# answer: in r11 hz_8b3da7a17132 lookup_similar_cases got the final JSON.
+_WORKER_LOOKUP_PREFIXES = (
+    "lookup_", "query_", "inspect_", "extract_", "check_", "broaden_", "recall_",
+)
+
+
+def _worker_tool_call_is_other_tools_reply(
+    agent_name: str, called_name: str, args: dict | None, registry: dict
+) -> bool:
+    """Round 18: True when a lookup tool got a final-answer JSON as its
+    arguments; a final JSON cannot be the legitimate input of a read-only
+    tool. Round 29 (6.11.2026 audit F6): the worker's OWN final answer in
+    a tool call is its reply in the wrong envelope, accepted first by
+    _worker_final_in_tool_call (in r23 the Intake model sent its reply as
+    extract_measurements two to three times per case and every reply was
+    thrown away until the 90 s cap); this helper fires only for the final
+    keys of a different worker, which stay a misroute."""
+    if not isinstance(args, dict) or not args:
+        return False
+    if not any(called_name.startswith(p) for p in _WORKER_LOOKUP_PREFIXES):
+        return False
+    this_schema = (registry.get(called_name) or (None, None))[1]
+    return any(
+        _worker_final_in_tool_call(other, args, this_schema)
+        for other in _WORKER_FINAL_KEYS
+        if other != agent_name
+    )
+
+
 def _worker_final_in_tool_call(agent_name: str, args: dict | None, schema: dict | None) -> bool:
     keys = _WORKER_FINAL_KEYS.get(agent_name) or ()
     if not isinstance(args, dict) or not keys:
@@ -3766,12 +3853,28 @@ def _react_worker_rounds(
                 result = {"ok": False, "error": f"unknown tool {name!r}"}
             elif _worker_final_in_tool_call(agent_name, parsed_args, tool_registry[name][1]):
                 # Round 11: the reply JSON arrived as a tool call; the
-                # arguments are the reply, nothing runs.
+                # arguments are the reply, nothing runs. Round 29 (audit
+                # F6): checked before the cross-tool test, whatever the tool
+                # name, so the worker's own reply is never thrown away.
                 misrouted_final = parsed_args
                 misrouted_now = True
                 # Round 16: not a failed tool. The reply came in the wrong
                 # envelope; it is used as the reply and labelled as such.
                 result = {"ok": False, "reply_in_tool_call": True, "error": "final reply arrived as a tool call; used as the reply"}
+            elif _worker_tool_call_is_other_tools_reply(
+                agent_name, name, parsed_args, tool_registry
+            ):
+                # Round 18: the arguments carry the final-answer shape of a
+                # DIFFERENT worker (r11 hz_8b3da7a17132 shape). Not a reply,
+                # not a tool call: recorded as a failed tool call and the
+                # loop keeps going so the model may answer as plain JSON next.
+                result = {
+                    "ok": False,
+                    "error": (
+                        "arguments look like another tool's final answer; "
+                        "reply with the final JSON content, not as a tool call"
+                    ),
+                }
             else:
                 fn, schema = tool_registry[name]
                 code = getattr(fn, "__code__", None)
@@ -3817,6 +3920,10 @@ def _react_worker_rounds(
                 "ok": bool(result.get("ok", False)),
                 "executed": not cap_hit and parsed_args is not None and not misrouted_now,
                 "reply_in_tool_call": misrouted_now,
+                # Round 18: the error string is surfaced so the autonomy
+                # record and tests can tell cross-tool rejects apart from
+                # a real tool failure (both have ok=False).
+                "error": None if result.get("ok") else str(result.get("error") or "")[:400],
             })
             step = {
                 "iter": state.get("iterations", 0) + 1,
@@ -3863,12 +3970,22 @@ def _react_worker_rounds(
 # that actually ran, numeric claims against the tools' own results). All
 # of it is deterministic; the LLM calls stay where they were.
 
+_MEASURE_CALL_SENTENCE = (
+    "Before filling reporter_signals, call extract_measurements with the raw text "
+    "and copy its numbers; never estimate centimetres yourself. "
+)
+_NO_MEASURE_SENTENCE = (
+    "The text states no number, so size_cm and depth_cm are null; never "
+    "estimate centimetres yourself. "
+)
+
+
 _AUTONOMY_ADDENDA = {
     "signal_extractor": (
         "\n\nAUTONOMOUS MODE. The detector class and the form values are not "
-        "given to you; only the reporter's text and the location are. Before "
-        "filling reporter_signals, call extract_measurements with the raw text "
-        "and copy its numbers; never estimate centimetres yourself. If the text "
+        "given to you; only the reporter's text and the location are. "
+        + _MEASURE_CALL_SENTENCE +
+        "If the text "
         "or the location names a place, call lookup_prior_reports(location, "
         "hazard_class) and mention the result in summary. Add to your JSON: "
         '"tools_used": [names of the tools you called].'
@@ -3937,10 +4054,24 @@ def _autonomy_record(parsed: dict | None, info: dict, required: tuple[str, ...])
     }
 
 
+def _agent_notes_count() -> int:
+    """Rows in agent_notes (a supervisor's lessons); 0 on any error."""
+    try:
+        with Database(get_settings().roadguard_db_path) as db:
+            row = db._conn.execute("SELECT COUNT(*) FROM agent_notes").fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
 def _worker_tools(agent: str, base: dict) -> dict:
     """The worker's registry; under autonomy perception and research also
-    get the shared lessons tool (recall_agent_notes)."""
+    get the shared lessons tool (recall_agent_notes), once a lesson exists.
+    Round 29 (6.11.2026 audit F7): in r23 the tool answered 0 lessons in
+    48 of 48 calls on an empty table, a hop spent for nothing."""
     if not worker_autonomy_enabled() or agent not in ("profile_builder", "rag_retriever"):
+        return base
+    if _agent_notes_count() <= 0:
         return base
     registry = dict(base)
     registry["recall_agent_notes"] = (recall_agent_notes, NOTES_SCHEMA)
@@ -4127,6 +4258,48 @@ def _policy_latency() -> dict[str, Any]:
     }
 
 
+def _deterministic_workers_reason(state: dict | None) -> str | None:
+    """Round 29 (6.11.2026 audit F12): the reason sanitize recorded when the
+    verdict is already fixed by the catalogue, in the shape the workers use
+    for llm_skipped_reason. None when the workers' LLM passes may matter."""
+    reason = (state or {}).get("deterministic_workers_reason")
+    return f"verdict_fixed:{reason}" if reason else None
+
+
+def _perception_llm_no_signal(yolo: dict, md: dict) -> str | None:
+    """Round 29 (6.11.2026 audit F7): the Perception LLM runs only on a
+    signal the rule profile does not read: reporter text, a detector
+    confidence inside the ambiguous band (policy
+    decision.needs_more_evidence.confidence_range) or more than one class
+    in the frame. In r23 it ran 89 times, 63 of its proposals were blocked
+    by the gates and the rule tree moved in 6 cases; on a single clear
+    class with no text its measured effect was a lower confidence (audit
+    22.10 said the same). Returns the skip reason, or None when the LLM
+    pass may matter."""
+    if (md.get("reporter_text") or "").strip():
+        return None
+    try:
+        conf = float(yolo.get("top1_confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    try:
+        band = (((load_policy() or {}).get("decision") or {}).get("needs_more_evidence") or {}).get("confidence_range") or [0.4, 0.6]
+        lo, hi = float(band[0]), float(band[1])
+    except (TypeError, ValueError, IndexError):
+        lo, hi = 0.4, 0.6
+    if lo <= conf < hi:
+        return None
+    classes = {
+        str(d.get("class") or "").upper()
+        for d in (yolo.get("detections") or [])
+        if isinstance(d, dict) and d.get("class")
+    }
+    classes |= {str(c).upper() for c in (yolo.get("n_detections_by_class") or {}) if c}
+    if len(classes) > 1:
+        return None
+    return "no_llm_signal (one class, confidence outside the ambiguous band, no reporter text)"
+
+
 def _clear_case_fast_path(yolo: dict, iq: dict, md: dict) -> str | None:
     """Return a reason slug when the optional worker LLM passes may be
     skipped for this submission, else None. Deterministic, policy-driven."""
@@ -4202,8 +4375,8 @@ def _policy_summary_for_prompt() -> str:
         f"  - D00/D10 (linear cracks) -> minor.\n"
         f"Action rules (Decision only):\n"
         f"  - urgent: D40 on main road with partial/full lane blockage and confidence>=0.6.\n"
-        f"  - needs_more_evidence: confidence in [0.4,0.6) AND no recurrence. At most ONE\n"
-        f"    evidence request per hazard; on the second pass decide or route to human_review.\n"
+        f"  - needs_more_evidence: not used; the reporter is never asked for another photo.\n"
+        f"    A detection with confidence in [0.4,0.6) and no recurrence is human_review.\n"
         f"  - human_review: perception_confidence=low, OR no_match from research, OR suspicious OCR,\n"
         f"    OR suspicious reporter text, OR non-road scene, OR the reporter's description\n"
         f"    contradicts the detector's class (intake contradiction).\n"
@@ -4245,14 +4418,14 @@ Output:
 _RESEARCH_FEWSHOT = """\
 EXAMPLE
 Input (truncated): hazard primary_class=D40 severity=severe road_type=main;
-                   quarantined_summaries=[{id: sec-4.3, hazard_type: pothole,
+                   quarantined_summaries=[{id: ex-id-00, hazard_type: pothole,
                    repair_window_hours: 24, severity_tier: urgent}].
 Output:
 {
-  "reasoning": "The retrieved standard sec-4.3 matches both hazard_class (pothole/D40) and road_type (main). Both axes covered - direct_match. Confidence high because one high-quality passage.",
+  "reasoning": "The retrieved standard ex-id-00 matches both hazard_class (pothole/D40) and road_type (main). Both axes covered - direct_match. Confidence high because one high-quality passage.",
   "coverage": "direct_match",
   "confidence": "high",
-  "key_findings": ["sec-4.3 says pothole on main road is a 24h repair window"]
+  "key_findings": ["ex-id-00 says pothole on main road is a 24h repair window"]
 }
 """
 
@@ -4261,17 +4434,17 @@ _DECISION_FEWSHOT = """\
 EXAMPLE
 Input (truncated): hazard_profile.primary_class=D40 severity=severe;
                    perception_confidence=high;
-                   research_handoff.coverage=direct_match tool_result_ids=["sec-4.3"];
+                   research_handoff.coverage=direct_match tool_result_ids=["ex-id-00"];
                    reporter_claims={size_cm: 40, depth_cm: 8, vehicles_swerving: true}.
 Output:
 {
-  "reasoning": "D40 on main road with lane blockage and high perception confidence - matches urgent rule. Research provides sec-4.3 which supports the 24h repair window. Grounded citation available, so I can take urgent.",
+  "reasoning": "D40 on main road with lane blockage and high perception confidence - matches urgent rule. Research provides ex-id-00 which supports the 24h repair window. Grounded citation available, so I can take urgent.",
   "action": "urgent",
-  "rationale": "D40 pothole blocking main road; sec-4.3 mandates 24h repair window",
+  "rationale": "D40 pothole blocking main road; ex-id-00 mandates 24h repair window",
   "priority": 90,
-  "cited_sources": ["sec-4.3"],
+  "cited_sources": ["ex-id-00"],
   "missing_evidence": [],
-  "assessment": "The detector and the form agree on a pothole in the driving path of a main road, and sec-4.3 sets a 24h repair window. The reporter's 40 cm by 8 cm and swerving vehicles are unverified but consistent with the lane blockage. On site, confirm the depth and whether the edge is undercut before dispatch."
+  "assessment": "The detector and the form agree on a pothole in the driving path of a main road, and ex-id-00 sets a 24h repair window. The reporter's 40 cm by 8 cm and swerving vehicles are unverified but consistent with the lane blockage. On site, confirm the depth and whether the edge is undercut before dispatch."
 }
 """
 
@@ -4430,6 +4603,9 @@ def _build_decision_prompt() -> str:
         "re-grade the number. Class names: D00 longitudinal crack, D10 transverse\n"
         "crack, D20 alligator crack, D40 pothole; never pair a code with another\n"
         "class's name.\n\n"
+        "Supervisor note: `supervisor_note` (pipeline_concern, expected_difficulty,\n"
+        "note) is the supervisor's advisory observation on the inputs; weigh it as\n"
+        "context, it is not a verdict and it names no action.\n\n"
         "Detector sanity: `quality_warnings` may flag the top-1 box as a tiny area\n"
         "(under 0.5% of the frame: often texture or shadow), an extreme aspect\n"
         "ratio (often a crack line or shadow) or a box hugging the frame edge\n"
@@ -5064,6 +5240,11 @@ class RagClient:
                     "source_url": meta.get("source_url", ""),
                     "issuing_body": meta.get("issuing_body", ""),
                     "date": meta.get("publication_date", ""),
+                    # Round 19 (3.11.2026): Benny's new corpus carries only
+                    # the source document filename on `source`; the Decision
+                    # payload shows it so the operator sees which standard
+                    # the passage came from.
+                    "source": meta.get("source", ""),
                     "hazard_types": [meta.get("hazard_class", "")],
                     "road_types": [meta.get("road_type") or "any"],
                     "article_ids": [str(_id)],
@@ -7438,8 +7619,16 @@ def _maybe_run_supervisor_agent(state: dict) -> dict:
         return {}
     yolo = state.get("yolo_output") or {}
     md = state.get("metadata") or {}
+    # Round 20 (3.11.2026): the supervisor's assess_input_complexity tool
+    # requires `hazard_class` by its signature; the payload used the key
+    # `hazard_class_detected`, so the tool failed every call ("hazard_class
+    # is required") and the supervisor read "no action needed, hazard
+    # class not provided" (r13 hz_0973521216da and other cases). Both
+    # keys are kept - the note check uses hazard_class_detected elsewhere.
+    hazard_class_value = yolo.get("top1_class")
     payload = {
-        "hazard_class_detected": yolo.get("top1_class"),
+        "hazard_class": hazard_class_value,
+        "hazard_class_detected": hazard_class_value,
         "detector_confidence": yolo.get("top1_confidence"),
         # Round 17: the band from the policy thresholds, so the note does
         # not re-grade the number.
@@ -7450,6 +7639,10 @@ def _maybe_run_supervisor_agent(state: dict) -> dict:
         "reporter_text_suspicious": bool(md.get("reporter_text_suspicious")),
         "iterations_so_far": state.get("iterations", 0),
     }
+    # Round 29 (6.11.2026 audit F9): the call is recorded like every
+    # worker's, so _compute_run_cost counts it (about 5 s per case that
+    # the run cost line never showed).
+    begin_llm_log()
     try:
         parsed, in_tok, out_tok, _info = _llm_react_worker(
             agent_name="supervisor",
@@ -7460,6 +7653,7 @@ def _maybe_run_supervisor_agent(state: dict) -> dict:
             provider_override=provider,
         )
     except Exception as exc:
+        end_llm_log()
         LOGGER.warning("supervisor_llm_failed: %s", exc)
         return {}
     plan = parsed if isinstance(parsed, dict) else {"pipeline_concern": "none",
@@ -7473,8 +7667,11 @@ def _maybe_run_supervisor_agent(state: dict) -> dict:
         "speaker": "supervisor",
         "kind": "supervisor_plan",
         "ts": time.time(),
-        "content": plan,
+        "content": dict(plan),
     }
+    _sup_calls = end_llm_log()
+    if _sup_calls:
+        trace_entry["content"]["llm"] = llm_summary(_sup_calls)
     update: dict = {
         "supervisor_plan": plan,
         "trace": [*drain_worker_steps(), trace_entry],
@@ -7602,6 +7799,32 @@ def sanitize_node(state: RoadGuardState) -> dict:
         catalog_hit, _yolo.get("top1_class"), None, _yolo.get("top1_confidence")
     )
     shortcut = bool(catalog_hit) and match_status["short_circuit_ok"]
+    # Round 29 (6.11.2026 audit F12): the workers' LLM passes cannot move a
+    # verdict the catalogue has already fixed: a sealed sha256 match ends as
+    # known_image (or, if the frame turns out severe, in the rule tree), and
+    # a phash neighbour inside the floor radius whose labels disagree with
+    # the live detector is routed to a human by the rule tree before any
+    # model text is read. In r23 these cases cost 45% of the round's LLM
+    # time for no change of verdict. The workers read this flag and run
+    # their rule paths; a detection at 0.00 is a placeholder, not evidence.
+    deterministic_reason: str | None = None
+    if shortcut:
+        deterministic_reason = "known_image_shortcut"
+    elif catalog_hit and str(catalog_hit.get("match") or "") == "phash":
+        try:
+            _live_conf = float(_yolo.get("top1_confidence") or 0.0)
+        except (TypeError, ValueError):
+            _live_conf = 0.0
+        _live_cls = str(_yolo.get("top1_class") or "").upper() or None
+        _labels = _catalog_classes_set(catalog_hit.get("classes") or "")
+        if (
+            _live_cls is not None
+            and _live_conf > 0.0
+            and _labels
+            and _live_cls not in _labels
+            and _phash_within_floor_distance(catalog_hit)
+        ):
+            deterministic_reason = "phash_class_mismatch_floor"
 
     trace_entry = {
         "iter": 0,
@@ -7614,6 +7837,7 @@ def sanitize_node(state: RoadGuardState) -> dict:
             "reporter_text_suspicious": reporter["is_suspicious_pattern"],
             "known_image_shortcut": shortcut,
             "image_match_reason": match_status.get("reason"),
+            "deterministic_workers": deterministic_reason,
         },
     }
 
@@ -7624,9 +7848,19 @@ def sanitize_node(state: RoadGuardState) -> dict:
         "trace": [trace_entry],
         "last_speaker": "sanitize",
         "next_hop": "decision" if shortcut else "profile_builder",
+        "deterministic_workers_reason": deterministic_reason,
     }
     if catalog_hit:
         update["dataset_match"] = catalog_hit
+    # Round 24 (4.11.2026): snapshot the four immutable inputs
+    # (yolo class + confidence, form road_type + lane_blocked) so any
+    # agent downstream can be checked for drift against them. Captured
+    # with the inputs as they land in state, after sanitize cleaned the
+    # metadata, before any worker had a chance to touch them.
+    update["_immutable_inputs"] = _immutable_inputs_of({
+        "yolo_output": _yolo,
+        "metadata": md,
+    })
     return update
 
 
@@ -7864,6 +8098,53 @@ def _extract_by_keywords(text: str) -> dict:
     }
 
 
+# Round 18 (2.11.2026): a reporter who says "No other photo is available" is
+# not describing a hazard. In r11 the signal extractor turned that single line
+# into a D40 pothole with partial lane blockage and swerving vehicles. Any
+# reporter text matching one of these phrases goes through _extract_by_keywords
+# (null for every field) and the LLM is never called.
+_NO_NEW_INFO_RE = re.compile(
+    r"\b(?:no\s+other\s+photo|this\s+is\s+the\s+only\s+(?:picture|photo|image|shot|one)|"
+    r"no\s+(?:more|further|additional)\s+(?:info|information|photo|photos|images|pictures|details)|"
+    r"nothing\s+(?:else|more|further)\s+to\s+(?:add|say|report|share)|"
+    r"all\s+I\s+have|only\s+(?:one|this)\s+(?:photo|picture|image)|"
+    r"cannot\s+(?:take|provide|supply|send)\s+(?:another|more|a\s+different))\b",
+    re.IGNORECASE,
+)
+
+
+def _text_is_no_new_info(text: str) -> bool:
+    """True when the reporter's text only says there is no new evidence."""
+    return bool(text) and bool(_NO_NEW_INFO_RE.search(text))
+
+
+def _verify_llm_claims(parsed: dict, text: str) -> dict:
+    """Round 18: drop any field the LLM returned that the text does not say.
+
+    The keyword tables are the ground truth; a hazard class, lane, road or
+    urgency claim survives only when the deterministic extractor would have
+    found it in the same text. Reporter signals are already verified by
+    _verified_signals, which runs after this."""
+    rule_based = _extract_by_keywords(text) if text else {
+        "mentioned": {"hazard_class": None, "lane_blocked": None, "road_type": None},
+        "urgency_claimed": False,
+    }
+    rule_mentioned = rule_based["mentioned"]
+    kept = dict(parsed.get("mentioned") or {})
+    dropped: list[str] = []
+    for key in ("hazard_class", "lane_blocked", "road_type"):
+        if kept.get(key) and kept[key] != rule_mentioned.get(key):
+            dropped.append(key)
+            kept[key] = None
+    parsed["mentioned"] = {k: kept.get(k) for k in ("hazard_class", "lane_blocked", "road_type")}
+    if parsed.get("urgency_claimed") and not rule_based.get("urgency_claimed"):
+        dropped.append("urgency_claimed")
+        parsed["urgency_claimed"] = False
+    if dropped:
+        parsed["dropped_unsupported"] = dropped
+    return parsed
+
+
 def _parse_intake_json(text: str) -> dict | None:
     stripped = (text or "").strip()
     if stripped.startswith("```"):
@@ -7896,6 +8177,19 @@ def _parse_intake_json(text: str) -> dict | None:
     }
 
 
+def _signal_worker_offer(text: str) -> tuple[dict, str]:
+    """Round 29 (6.11.2026 audit F6): the tools and the system prompt the
+    Intake agent gets. extract_measurements is a regex over digits; on
+    text without one it returned null in every field (8 of 8 in r23) and
+    the model still had to call it. It is offered, and required, only when
+    the text carries a digit; the prompt sentence changes with it."""
+    prompt = _autonomy_prompt("signal_extractor", SIGNAL_EXTRACTOR_SYSTEM_PROMPT)
+    if re.search(r"\d", text or ""):
+        return SIGNAL_WORKER_TOOLS, prompt
+    tools = {k: v for k, v in SIGNAL_WORKER_TOOLS.items() if k != "extract_measurements"}
+    return tools, prompt.replace(_MEASURE_CALL_SENTENCE, _NO_MEASURE_SENTENCE)
+
+
 def _extract_by_llm(
     text: str, md: dict, yolo: dict, state: dict | None = None
 ) -> tuple[dict | None, int, int, dict | None]:
@@ -7919,11 +8213,12 @@ def _extract_by_llm(
     # ReAct path: when enabled AND a per-worker LLM is set, the Intake agent
     # may call extract_measurements / lookup_prior_reports before replying.
     if worker_react_enabled() and provider:
+        tools, system_prompt = _signal_worker_offer(text)
         raw, in_tok, out_tok, info = _llm_react_worker(
             agent_name="signal_extractor",
-            system_prompt=_autonomy_prompt("signal_extractor", SIGNAL_EXTRACTOR_SYSTEM_PROMPT),
+            system_prompt=system_prompt,
             user_payload=payload,
-            tool_registry=SIGNAL_WORKER_TOOLS,
+            tool_registry=tools,
             state=state or {},
             provider_override=provider,
             time_cap_s=_policy_latency()["worker_time_cap_s"] if autonomous else None,
@@ -7934,7 +8229,9 @@ def _extract_by_llm(
         parsed = _parse_intake_json(json.dumps(raw)) if isinstance(raw, dict) else None
         autonomy = None
         if autonomous:
-            autonomy = _autonomy_record(raw, info, required=("extract_measurements",))
+            autonomy = _autonomy_record(
+                raw, info, required=("extract_measurements",) if "extract_measurements" in tools else (),
+            )
             if parsed is not None:
                 parsed["reporter_signals"] = _verified_signals(
                     text, parsed.get("reporter_signals"), info, autonomy
@@ -7995,6 +8292,22 @@ def signal_extractor_node(state: RoadGuardState) -> dict:
     yolo = state.get("yolo_output") or {}
     text = (md.get("reporter_text") or "").strip()
     suspicious = bool(md.get("reporter_text_suspicious"))
+    # Round 18 (2.11.2026): a resumed pass with the original photo re-sent
+    # under a note (evidence_declined) has nothing new for the extractor to
+    # read; in r11 the second-pass call ran 90 s for 0 tokens. The first
+    # pass's intake has already been checkpointed; skip the LLM entirely.
+    skip_reason: str | None = None
+    if state.get("evidence_declined"):
+        skip_reason = "evidence_declined"
+    elif _deterministic_workers_reason(state):
+        # Round 29 (audit F12): the catalogue has fixed the verdict; the
+        # keyword extractor still records what the reporter claimed.
+        skip_reason = _deterministic_workers_reason(state)
+    elif _text_is_no_new_info(text):
+        # The text says "no other photo is available" and nothing else;
+        # the keyword extractor would return null for every field, and the
+        # LLM has nothing to find there. See r11 hz_ca2415101a88.
+        skip_reason = "no_new_info"
 
     intake: dict = {
         "text": text,
@@ -8008,7 +8321,8 @@ def signal_extractor_node(state: RoadGuardState) -> dict:
     signals = _empty_signals()
     in_tok = out_tok = 0
     autonomy: dict | None = None
-    if text:
+    dropped: list[str] = []
+    if text and skip_reason is None:
         extracted = None
         if not suspicious:
             # Flagged text is already headed for human_review; the LLM
@@ -8018,7 +8332,19 @@ def signal_extractor_node(state: RoadGuardState) -> dict:
             extracted = _extract_by_keywords(text)
             intake["source"] = "rules"
         else:
-            intake["source"] = "llm"
+            # Round 18: drop any claim the LLM made that the text does not
+            # support (r11 hz_ca2415101a88: "no other photo is available"
+            # became D40 + partial lane + urgency). Keyword rules are the
+            # ground truth; the LLM may at most agree with them.
+            extracted = _verify_llm_claims(extracted, text)
+            dropped = extracted.pop("dropped_unsupported", [])
+            intake["source"] = "llm_strict" if dropped else "llm"
+        signals = extracted.pop("reporter_signals", None) or signals
+        intake.update(extracted)
+        intake["contradictions"] = _contradictions(intake["mentioned"], yolo, md)
+    elif text:
+        extracted = _extract_by_keywords(text)
+        intake["source"] = f"skipped:{skip_reason}"
         signals = extracted.pop("reporter_signals", None) or signals
         intake.update(extracted)
         intake["contradictions"] = _contradictions(intake["mentioned"], yolo, md)
@@ -8037,6 +8363,10 @@ def signal_extractor_node(state: RoadGuardState) -> dict:
             "reporter_signals": signals,
             "suspicious": suspicious,
             "llm_used": in_tok > 0,
+            # Round 18: fields the LLM claimed and the text did not support,
+            # and the skip reason when the LLM was not called at all.
+            **({"dropped_unsupported": dropped} if dropped else {}),
+            **({"skip_reason": skip_reason} if skip_reason else {}),
         },
     }
     if autonomy is not None:
@@ -8081,6 +8411,65 @@ def signal_extractor_node(state: RoadGuardState) -> dict:
 
 
 _VALID_SEVERITY = {"minor", "moderate", "severe"}
+# Round 18 (2.11.2026): the LLM may lower severity (minor evidence found)
+# but never raise it; raising requires numeric evidence the Python gates own.
+_SEVERITY_RANK = {"minor": 0, "moderate": 1, "severe": 2}
+# Numeric claims the perception rationale is allowed to state; anything
+# off the actual inputs is replaced by the deterministic rationale.
+_AREA_CLAIM_RE = re.compile(r"area_ratio\s*(?:>|>=|is|=|of|about|at)?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_CONF_CLAIM_RE = re.compile(r"confidence\s*(?:>|>=|is|=|of|about|at)?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_LANE_CLAIM_RE = re.compile(r"\b(?:partial(?:ly)?|full(?:y)?)?\s*lane\s*(?:blockage|block\w*)\b", re.IGNORECASE)
+# Round 18 (2.11.2026): a rationale that calls the case urgent must be
+# backed by passages that spoke of urgency; otherwise it is the model's
+# wording and the fact-check replaces it.
+_URGENCY_WORDS_RE = re.compile(
+    r"\b(urgent(?:ly)?|immediate(?:ly)?|without delay|high[- ]priority|high[- ]risk|"
+    r"emergency|cat ?1|category 1|dispatch (?:now|at once|immediately))\b",
+    re.IGNORECASE,
+)
+
+
+def _verify_perception_rationale(
+    rationale: str, yolo: dict, iq: dict, md: dict
+) -> tuple[str, list[str]]:
+    """Round 18: return (clean_rationale, problems). The LLM's severity rationale
+    is checked against the actual numbers from yolo/iq/md; a claim about a
+    confidence threshold, an area_ratio or a lane blockage that the inputs do
+    not back is flagged. Returns the input unchanged with an empty list when
+    every claim is grounded."""
+    if not isinstance(rationale, str) or not rationale:
+        return rationale or "", []
+    problems: list[str] = []
+    try:
+        actual_conf = float(yolo.get("top1_confidence") or 0.0)
+    except (TypeError, ValueError):
+        actual_conf = 0.0
+    detections = yolo.get("detections") or []
+    try:
+        actual_area = max(
+            (float(d.get("area_ratio") or 0.0) for d in detections if isinstance(d, dict)),
+            default=0.0,
+        )
+    except (TypeError, ValueError):
+        actual_area = 0.0
+    lane = str(md.get("lane_blocked") or "none")
+    for m in _CONF_CLAIM_RE.finditer(rationale):
+        try:
+            claimed = float(m.group(1))
+        except ValueError:
+            continue
+        if claimed > actual_conf + 0.02:
+            problems.append(f"confidence_claim_{claimed:.2f}_vs_actual_{actual_conf:.2f}")
+    for m in _AREA_CLAIM_RE.finditer(rationale):
+        try:
+            claimed = float(m.group(1))
+        except ValueError:
+            continue
+        if claimed > actual_area + 0.005:
+            problems.append(f"area_ratio_claim_{claimed:.3f}_vs_actual_{actual_area:.3f}")
+    if lane == "none" and _LANE_CLAIM_RE.search(rationale):
+        problems.append("lane_blockage_claim_but_form_says_none")
+    return rationale, problems
 _VALID_CONFIDENCE = {"high", "medium", "low"}
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
@@ -8299,13 +8688,65 @@ def _llm_refine(
     if not isinstance(missing, list):
         missing = base_missing
 
+    # Round 18 (2.11.2026): numeric gates for severity live in Python. The
+    # LLM may keep or lower the deterministic severity; raising it requires
+    # evidence that only the Python rule tree owns (lane blockage, area
+    # ratio, confidence floor). An upgrade is blocked and the autonomy
+    # record names it; the model's would-have-said value stays in the trace.
+    base_sev = str(base_profile.get("severity_signal") or "minor")
+    requested_sev = str(parsed["severity_signal"])
+    final_sev = requested_sev
+    blocked_upgrade = False
+    blocked_downgrade = False
+    if _SEVERITY_RANK.get(requested_sev, 0) > _SEVERITY_RANK.get(base_sev, 0):
+        final_sev = base_sev
+        blocked_upgrade = True
+    elif _SEVERITY_RANK.get(requested_sev, 0) < _SEVERITY_RANK.get(base_sev, 0):
+        # Round 21 (3.11.2026): a downgrade needs a positive signal, not
+        # just "no prior reports" or "low area_ratio". The owner saw
+        # profiles downgrade on absence of history. The LLM must point to
+        # a measurable low-severity cue in its rationale (small cm value,
+        # healed edge, surface crack only) or we keep the base severity.
+        rationale_low = str(parsed.get("severity_rationale") or "").lower()
+        positive_signals = (
+            "small ", "superficial", "shallow", "surface crack", "no spalling",
+            "healed", "edge intact", "narrow crack", "light severity",
+            "< 1 cm", "< 2 cm", "under 2 cm", "under 1 cm",
+        )
+        has_signal = any(w in rationale_low for w in positive_signals)
+        if not has_signal:
+            final_sev = base_sev
+            blocked_downgrade = True
+    # Round 18: the rationale is validated against the actual numbers; a
+    # claim the inputs do not back makes the deterministic one win.
+    rationale_text, rationale_problems = _verify_perception_rationale(
+        str(parsed.get("severity_rationale") or ""), yolo, iq, md
+    )
+    if rationale_problems:
+        rationale_text = (
+            f"{base_profile.get('severity_rationale') or ''} "
+            f"(LLM rationale flagged: {','.join(rationale_problems)})"
+        )
     refined = {
-        "severity_signal": parsed["severity_signal"],
-        "severity_rationale": str(parsed.get("severity_rationale") or "")[:200],
+        "severity_signal": final_sev,
+        "severity_rationale": rationale_text[:200],
         "confidence": parsed["confidence"],
         "needs_more_evidence": bool(parsed.get("needs_more_evidence", base_needs_more)),
         "missing_fields": [str(m) for m in missing][:5],
     }
+    if blocked_upgrade or blocked_downgrade or rationale_problems:
+        if autonomy is None:
+            autonomy = {"mode": "deterministic", "violations": [], "tools_used": []}
+        if blocked_upgrade:
+            autonomy.setdefault("violations", []).append(
+                f"severity_blocked_upgrade:{requested_sev}_to_{final_sev}"
+            )
+        if blocked_downgrade:
+            autonomy.setdefault("violations", []).append(
+                f"severity_blocked_downgrade:{requested_sev}_to_{final_sev}"
+            )
+        for p in rationale_problems:
+            autonomy.setdefault("violations", []).append(f"rationale_claim:{p}")
     if autonomy is not None:
         refined["autonomy"] = autonomy
     return refined, in_tok, out_tok
@@ -8443,7 +8884,11 @@ def profile_builder_node(state: RoadGuardState) -> dict:
     if iq.get("brightness_mean", 0.5) < 0.2:
         base_missing.append("lighting")
 
-    fast_path = _clear_case_fast_path(yolo, iq, md)
+    fast_path = (
+        _clear_case_fast_path(yolo, iq, md)
+        or _deterministic_workers_reason(state)
+        or _perception_llm_no_signal(yolo, md)
+    )
     llm_enabled = _profile_llm_enabled() and fast_path is None
     if llm_enabled:
         refined, in_tok, out_tok = _llm_refine(
@@ -8530,6 +8975,26 @@ def profile_builder_node(state: RoadGuardState) -> dict:
     if refined.get("autonomy"):
         trace_entry["content"]["autonomy"] = refined["autonomy"]
     trace_entry["content"]["dataset_lookup"] = _dataset_lookup_summary(dataset_hit)
+    # Round 24 (4.11.2026) P0-C: the immutable YOLO / form inputs stay
+    # as they entered sanitize. If any agent has tried to overwrite one
+    # of them, the drift list lands on the trace and the state is
+    # restored to the snapshot before the next agent runs.
+    drift = _immutable_inputs_drift(state)
+    if drift:
+        trace_entry["content"]["immutable_inputs_drift"] = drift
+        snap = state.get("_immutable_inputs") or {}
+        yolo2 = dict(state.get("yolo_output") or {})
+        md2 = dict(state.get("metadata") or {})
+        if "top1_class" in drift:
+            yolo2["top1_class"] = snap["top1_class"]
+        if "top1_confidence" in drift:
+            yolo2["top1_confidence"] = snap["top1_confidence"]
+        if "road_type" in drift:
+            md2["road_type"] = snap["road_type"]
+        if "lane_blocked" in drift:
+            md2["lane_blocked"] = snap["lane_blocked"]
+        state["yolo_output"] = yolo2
+        state["metadata"] = md2
 
     update: dict = {
         "hazard_profile": profile,
@@ -8582,6 +9047,70 @@ def profile_builder_node(state: RoadGuardState) -> dict:
 
 
 _VALID_COVERAGE = {"direct_match", "partial_match", "no_match"}
+
+
+_RETRIEVAL_CACHE: dict[tuple, tuple[float, dict]] = {}
+_RETRIEVAL_CACHE_TTL_S = 3600.0
+
+
+def _clear_retrieval_cache() -> None:
+    _RETRIEVAL_CACHE.clear()
+
+
+def _cached_repair_standards(hazard_class: str, road_type: str, k: int = 3) -> tuple[dict, str]:
+    """Round 29 (6.11.2026 audit F8): query_repair_standards through a
+    per-process cache. In r23 the 94 runs asked four distinct queries (the
+    query is derived from class and road type) and embedded each one 94
+    times. Keyed by the tool function (a test stub gets its own entries),
+    the corpus path, class, road type and k; an entry lives an hour, and
+    the caller gets a copy, so the filters downstream never touch the
+    cached passages. Returns (result, "hit" | "miss")."""
+    import copy as _copy
+    fn = RESEARCH_TOOLS["query_repair_standards"][0]
+    try:
+        corpus = str(get_settings().roadguard_rag_path)
+    except Exception:
+        corpus = ""
+    key = (id(fn), corpus, str(hazard_class), str(road_type), int(k))
+    now = time.time()
+    hit = _RETRIEVAL_CACHE.get(key)
+    if hit and hit[0] > now:
+        return _copy.deepcopy(hit[1]), "hit"
+    result = fn(hazard_class=hazard_class, road_type=road_type, k=k)
+    _RETRIEVAL_CACHE[key] = (now + _RETRIEVAL_CACHE_TTL_S, _copy.deepcopy(result))
+    return result, "miss"
+
+
+def _drop_non_road_passages(result: dict, hazard_class: str, road_type: str, perception_conf: str) -> None:
+    """27.10.2026 relevance filter: non-road passages (safety-non-road-* in
+    mini_corpus) were being returned for every D40/D20 road query, and the
+    LLM's own key_findings called them "non-applicable". Drop them unless
+    the current frame actually reads as a non-road scene; in that case the
+    perception_confidence floor already routes to human_review, which uses
+    the passage directly. Coverage is regraded on what is left (the
+    tool's own label is replaced whenever passages remain)."""
+    if perception_conf == "low":
+        return
+    filtered_procs = []
+    filtered_ids: set[str] = set()
+    for p in result["procedures"]:
+        ids = p.get("article_ids") or []
+        drop = any(
+            str(aid).lower().startswith(("safety-non-road", "non-road"))
+            for aid in ids
+        )
+        if drop:
+            for aid in ids:
+                filtered_ids.add(str(aid))
+            continue
+        filtered_procs.append(p)
+    if filtered_procs or filtered_ids:
+        result["procedures"] = filtered_procs
+        result["tool_result_ids"] = [
+            aid for aid in result.get("tool_result_ids", [])
+            if aid not in filtered_ids
+        ]
+        result["coverage"] = _coverage(filtered_procs, hazard_class, road_type)
 
 
 def _rag_llm_enabled() -> bool:
@@ -8838,8 +9367,20 @@ def rag_retriever_node(state: RoadGuardState) -> dict:
 
     fast_path = _clear_case_fast_path(
         state.get("yolo_output") or {}, state.get("image_quality") or {}, md
-    )
+    ) or _deterministic_workers_reason(state)
     llm_enabled = _rag_llm_enabled() and fast_path is None
+    # Round 29 (6.11.2026 audit F8): the deterministic retrieval comes first
+    # (cached per class and road type), and the research LLM, relabel or
+    # autonomous retrieval, runs only when the tool-graded coverage is not
+    # direct_match. In r23 it ran 94 times, changed 44 labels and no
+    # verdict; the direct_match cases it relabelled read to the operator
+    # as if something had changed.
+    perception_conf = state.get("perception_confidence", "medium")
+    det_result, rag_cache = _cached_repair_standards(hazard_class, road_type, k=3)
+    _drop_non_road_passages(det_result, hazard_class, road_type, perception_conf)
+    if llm_enabled and det_result.get("coverage") == "direct_match":
+        llm_enabled = False
+        fast_path = "coverage_direct_match"
     autonomous = llm_enabled and worker_autonomy_enabled()
     auto_label: dict | None = None
     autonomy: dict | None = None
@@ -8853,44 +9394,17 @@ def rag_retriever_node(state: RoadGuardState) -> dict:
             hazard_class, road_type, profile, md, state
         )
     if result is None:
-        result = RESEARCH_TOOLS["query_repair_standards"][0](
-            hazard_class=hazard_class, road_type=road_type, k=3
-        )
+        result = det_result
         if autonomy is not None:
             autonomy["fallback"] = (
                 f"deterministic_query ({len(result.get('procedures') or [])} passages)"
             )
             autonomy["auto_ran"] = ["query_repair_standards"]
 
-    # 27.10.2026 relevance filter: non-road passages (safety-non-road-* in
-    # mini_corpus) were being returned for every D40/D20 road query, and
-    # the LLM's own key_findings called them "non-applicable". Drop them
-    # unless the current frame actually reads as a non-road scene; in
-    # that case the perception_confidence floor already routes to
-    # human_review, which uses the passage directly.
-    perception_conf = state.get("perception_confidence", "medium")
-    if perception_conf != "low":
-        filtered_procs = []
-        filtered_ids: set[str] = set()
-        for p in result["procedures"]:
-            ids = p.get("article_ids") or []
-            drop = any(
-                str(aid).lower().startswith(("safety-non-road", "non-road"))
-                for aid in ids
-            )
-            if drop:
-                for aid in ids:
-                    filtered_ids.add(str(aid))
-                continue
-            filtered_procs.append(p)
-        if filtered_procs or filtered_ids:
-            result["procedures"] = filtered_procs
-            result["tool_result_ids"] = [
-                aid for aid in result.get("tool_result_ids", [])
-                if aid not in filtered_ids
-            ]
-            # Recompute coverage based on what is actually left.
-            result["coverage"] = _coverage(filtered_procs, hazard_class, road_type)
+    # 27.10.2026 relevance filter (see _drop_non_road_passages); the
+    # deterministic result was already graded before the LLM gate above,
+    # the agent's own retrieval is graded here.
+    _drop_non_road_passages(result, hazard_class, road_type, perception_conf)
 
     # Trace enrichment (27.10.2026): the batch log hid WHAT the RAG actually
     # retrieved - only ids and findings were printed, so an auditor could
@@ -8929,6 +9443,7 @@ def rag_retriever_node(state: RoadGuardState) -> dict:
                 "source_url": p.get("source_url"),
                 "issuing_body": p.get("issuing_body"),
                 "date": p.get("date"),
+                "source": p.get("source", ""),
                 "article_ids": p.get("article_ids", []),
                 "quarantined_summary": quarantined,
                 "relevance": p.get("relevance") or {},
@@ -9013,6 +9528,7 @@ def rag_retriever_node(state: RoadGuardState) -> dict:
             # dump. passage_previews are already truncated per-chunk.
             "rag_query": rag_query_str,
             "rag_filter": {"hazard_class": hazard_class, "road_type": road_type, "k": 3},
+            "rag_cache": rag_cache,
             "passage_previews": passage_previews,
         },
     }
@@ -9102,9 +9618,16 @@ def rag_retriever_node(state: RoadGuardState) -> dict:
 
 MAX_GROUNDING_RETRIES = 1  # one retry; the LLM rarely learns from more
 # policy.yaml decision.needs_more_evidence.max_requests_per_hazard
-MAX_EVIDENCE_REQUESTS_PER_HAZARD = 1
-# Roadmap section 8(b): ReAct in Decision only, hops <= 2.
-DECISION_REACT_MAX_HOPS = 2
+# 6.11.2026 (owner): 0, the reporter is never asked for another photo; a
+# needs_more_evidence verdict becomes human_review in _apply_evidence_cap.
+MAX_EVIDENCE_REQUESTS_PER_HAZARD = 0
+# Round 25 (4.11.2026) P1 (owner's analysis of the r22 run): Decision
+# ReAct is now capped at ONE tool-call hop, not two. Previously the
+# model could call two tools before committing to a verdict; in the
+# r22 log that produced 3 LLM calls (hop_1, hop_2, final) and 236 s
+# on a single case. One hop is enough for the lookup the model needs;
+# a second hop was almost never grounded in the first result anyway.
+DECISION_REACT_MAX_HOPS = 1
 
 _VALID_ACTIONS = {"urgent", "standard", "needs_more_evidence", "human_review", "known_image"}
 # IDX 18: the supervisor reads the assessment as model text; bounded and
@@ -9123,8 +9646,66 @@ _DEFAULT_EVIDENCE_MESSAGES = {
 }
 
 
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def _close_json(text: str) -> str:
+    """Close what the reply left open: an unterminated string, then the
+    brackets and braces still open, innermost first."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack and stack[-1] == ch:
+            stack.pop()
+    out = text + ('"' if in_string else "")
+    out = _TRAILING_COMMA_RE.sub(r"\1", out.rstrip())
+    if out.rstrip().endswith(","):
+        out = out.rstrip()[:-1]
+    return out + "".join(reversed(stack))
+
+
+def _repair_json_object(text: str) -> dict | None:
+    """Round 29 (6.11.2026 audit F10): a reply that is not valid JSON as a
+    whole is repaired deterministically before it counts as unparseable:
+    the first {...} block is cut out of the surrounding prose, trailing
+    commas are removed and unbalanced braces, brackets or a string are
+    closed. In r23 6 of 40 Decision replies (3 of the 4 real reports)
+    failed to parse and the rule tree decided without the model."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    # a fence the model opened after prose and never closed ends the body
+    body = text[start:].split("```")[0]
+    end = body.rfind("}")
+    candidates = [body[: end + 1]] if end >= 0 else []
+    candidates.append(body)
+    for cand in candidates:
+        for fixed in (cand, _TRAILING_COMMA_RE.sub(r"\1", cand), _close_json(cand)):
+            try:
+                obj = json.loads(fixed)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return None
+
+
 def _parse_json_object(text: str) -> dict | None:
-    """Strip optional markdown fences and parse one JSON object."""
+    """Strip optional markdown fences and parse one JSON object; a reply
+    that does not parse as a whole goes through _repair_json_object."""
     if not text:
         return None
     stripped = text.strip()
@@ -9135,7 +9716,7 @@ def _parse_json_object(text: str) -> dict | None:
     try:
         obj = json.loads(stripped)
     except json.JSONDecodeError:
-        return None
+        obj = _repair_json_object(stripped)
     return obj if isinstance(obj, dict) else None
 
 
@@ -9149,6 +9730,26 @@ def _intake_class_contradiction(state: RoadGuardState) -> tuple[bool, str]:
 
 def _react_enabled() -> bool:
     return os.environ.get("AGENT_DECISION_REACT", "0") == "1"
+
+
+def _phash_floor_max_distance() -> int:
+    """known_image.phash_floor_max_distance from policy.yaml (default 10, the
+    known-image lookup radius)."""
+    try:
+        return int(((load_policy() or {}).get("known_image") or {}).get("phash_floor_max_distance", 10))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _phash_within_floor_distance(match: dict | None) -> bool:
+    """6.11.2026 audit F5: in r23 the class-mismatch floor fired on neighbours
+    at phash distance 12-16 (the relaxed lookup radius), which is context,
+    not evidence about this photo. The floor fires only inside the policy
+    radius; a match without a numeric distance keeps the old behaviour."""
+    try:
+        return int((match or {}).get("distance")) <= _phash_floor_max_distance()
+    except (TypeError, ValueError):
+        return True
 
 
 def _decide_rule_based(state: RoadGuardState) -> dict:
@@ -9172,6 +9773,46 @@ def _decide_rule_based(state: RoadGuardState) -> dict:
         _live_cls, _live_conf = _detector_prediction_from_state(state)
         _sev = str((state.get("hazard_profile") or {}).get("severity_signal") or "")
         image_status = _image_match_status(match, _live_cls, _sev, _live_conf)
+        # Round 21 (3.11.2026): a phash neighbour whose catalogue labels
+        # disagree with the live detector's class is NOT standard material.
+        # In r13 hz_770ac7c30461 (live D20, catalogue D40) and
+        # hz_995e3102af69 (live D40, catalogue D20) the verdict was
+        # standard; the owner's rule is "approximate similarity cannot
+        # validate classification". Routed to a human.
+        _catalog_classes = _catalog_classes_set(_summary.get("classes") or "")
+        if (
+            str(_summary.get("match") or "") == "phash"
+            and _phash_within_floor_distance(match)
+            and _live_cls is not None
+            and _catalog_classes
+            and _live_cls not in _catalog_classes
+        ):
+            severity_tool = DECISION_TOOLS["check_hazard_severity"][0](
+                hazard_class=(state.get("hazard_profile") or {}).get("primary_class") or "",
+                confidence=float((state.get("hazard_profile") or {}).get("primary_confidence") or 0.0),
+                road_type=(state.get("metadata") or {}).get("road_type") or "main",
+                lane_blocked=(state.get("metadata") or {}).get("lane_blocked") or "none",
+                recurrence_count_30d=(state.get("hazard_profile") or {}).get("recurrence_count_30d", 0),
+            )
+            return {
+                "action": "human_review",
+                "rationale": (
+                    f"phash similar photo (pic_id={_summary.get('pic_id')}, "
+                    f"distance {match.get('distance')}) with catalogue labels "
+                    f"{sorted(_catalog_classes)} disagrees with the live detector's "
+                    f"{_live_cls}; approximate similarity cannot validate the class."
+                )[:500],
+                "priority": int(severity_tool.get("priority") or 50),
+                "cited_sources": image_match_cite,
+                "missing_evidence": [],
+                "floor_applied": True,
+                "floor_reason": "phash_class_mismatch",
+                "floor_trigger": (
+                    f"catalog_classes={sorted(_catalog_classes)} vs "
+                    f"live_class={_live_cls} (phash distance={match.get('distance')})"
+                ),
+                "image_match_status": image_status,
+            }
     profile = state.get("hazard_profile") or {}
     md = state.get("metadata") or {}
     tool_result_ids = state.get("tool_result_ids") or []
@@ -9240,14 +9881,16 @@ def _decide_rule_based(state: RoadGuardState) -> dict:
         })
 
     if pol["nme_lo"] <= confidence < pol["nme_hi"] and not profile.get("is_recurring_location"):
+        # 6.11.2026 (owner): an ambiguous detection goes to a human; the
+        # reporter is never asked for another photo.
         return _finalize({
-            "action": "needs_more_evidence",
+            "action": "human_review",
             "rationale": (
-                f"confidence {confidence:.2f} in ambiguous band for {hazard_class}"
+                f"confidence {confidence:.2f} in ambiguous band for {hazard_class}; routed to a human"
             ),
             "priority": priority,
             "cited_sources": [],
-            "missing_evidence": ["second_angle"],
+            "missing_evidence": [],
         })
 
     if coverage == "no_match":
@@ -9385,18 +10028,23 @@ def _catalogue_context_for_prompt(match: dict | None) -> dict:
         similarity_pct = max(0, 100 - int(round(float(distance) * 100 / 64))) if distance is not None else None
     except (TypeError, ValueError):
         similarity_pct = None
+    # Round 20 (3.11.2026): phash neighbours are hidden from the Decision
+    # prompt entirely. The LLM cannot copy a pic_id it never saw, nor cite
+    # the neighbour's class or prediction as evidence about this photo.
+    # The rule tree and the trace still see the match (they are not fed
+    # into the model). The payload tells the model only the fact that an
+    # approximate match exists, so it knows to prefer human_review on
+    # contradictory detections without any identifying detail.
     return {
         "dataset_match": None,
         "similar_catalogue_photo": {
             "note": (
-                "a DIFFERENT catalogued photo that looks alike (perceptual hash); "
-                "its labels describe that photo, not this one"
+                "An approximate (perceptual-hash) match to a different "
+                "catalogued photo exists. Its labels, pic_id and recorded "
+                "prediction are intentionally HIDDEN from you to prevent "
+                "copying them as evidence about this photo. On a "
+                "contradictory detection prefer human_review."
             ),
-            "pic_id": summary.get("pic_id"),
-            "phash_distance": distance,
-            "similarity_pct": similarity_pct,
-            "its_labels": summary.get("classes"),
-            "its_recorded_prediction": summary.get("model_prediction"),
         },
     }
 
@@ -9427,12 +10075,21 @@ def _decision_messages(state: RoadGuardState, rule_hint: dict) -> list[dict]:
     perception_conf = state.get("perception_confidence", "medium")
     intake = state.get("reporter_intake") or {}
     signals = state.get("reporter_signals") or {}
+    supervisor_plan = state.get("supervisor_plan") or {}
 
     user_payload = {
         "hazard_profile": profile,
         "perception_confidence": perception_conf,
         # Round 17: one wording for the detector's confidence (policy bands).
         "detector_confidence_band": _confidence_band(profile.get("primary_confidence")),
+        # Round 29 (6.11.2026 audit F9): the supervisor's advisory note has
+        # a reader. In r23 pipeline_concern and expected_difficulty were
+        # written to the trace and read by nobody.
+        "supervisor_note": {
+            "pipeline_concern": supervisor_plan.get("pipeline_concern"),
+            "expected_difficulty": supervisor_plan.get("expected_difficulty"),
+            "note": str(supervisor_plan.get("note") or "")[:240],
+        } if supervisor_plan else None,
         "metadata": {
             "road_type": md.get("road_type"),
             "lane_blocked": md.get("lane_blocked"),
@@ -9447,10 +10104,20 @@ def _decision_messages(state: RoadGuardState, rule_hint: dict) -> list[dict]:
         "procedures": [
             {
                 # The model cites article_ids; the URL cost tokens and was
-                # never read (round 10).
+                # never read (round 10). Round 18 adds the date and the
+                # URL slug so the model can tell when a passage is outdated.
+                # Round 19 (3.11.2026): Benny's corpus only carries a source
+                # document filename; surface it here so the model can name
+                # the document in its assessment, instead of only an opaque
+                # article_id. The filename comes through on `source.name`.
                 "issuing_body": p.get("issuing_body"),
                 "article_ids": (p.get("article_ids") or [])[:3],
                 "quarantined_summary": p.get("quarantined_summary", {}),
+                "source": {
+                    "name": (p.get("source") or p.get("source_name") or "")[:120],
+                    "url": p.get("source_url") or "",
+                    "date": p.get("date") or "",
+                },
             }
             for p in procedures[:3]  # Decision only needs the top 3
         ],
@@ -9592,7 +10259,7 @@ def _llm_decide(
 def _decision_tools() -> dict:
     """DECISION_TOOLS, plus the shared lessons tool when the workers run
     autonomously (one memory for every agent)."""
-    if not worker_autonomy_enabled():
+    if not worker_autonomy_enabled() or _agent_notes_count() <= 0:
         return DECISION_TOOLS
     tools = dict(DECISION_TOOLS)
     tools["recall_agent_notes"] = (recall_agent_notes, NOTES_SCHEMA)
@@ -9878,12 +10545,20 @@ def _llm_decide_react(
     if state.get("dataset_match"):
         # a catalogued image gets no repair recommendation: read-only tools only
         schemas = [sc for sc in schemas if sc["function"]["name"] in _READ_ONLY_DECISION_TOOLS]
+    # Round 29 (6.11.2026 audit F10): below a two-hop cap the model never
+    # called a tool (0 of 30 ReAct runs in r23) while five schemas, about
+    # 860 tokens, rode every call. With the cap under 2 no schema is sent
+    # and the reply is the one JSON answer; the deterministic tool results
+    # are already in the payload. The round 10 tests pin the cap at 2.
+    if DECISION_REACT_MAX_HOPS < 2:
+        schemas = []
     tools_run: dict = {}
     calls: list[dict] = []
     steps: list[dict] = []
     hops = 0
     total_in = total_out = 0
-    info = {"tools_run": tools_run, "hops": 0, "calls": calls, "steps": steps}
+    info = {"tools_run": tools_run, "hops": 0, "calls": calls, "steps": steps,
+            "tools_offered": len(schemas)}
 
     try:
         messages = _decision_messages(state, rule_hint)
@@ -9916,7 +10591,7 @@ def _llm_decide_react(
             })
             nudged = True
         try:
-            msg, in_tok, out_tok = chat(messages, tools=schemas, temperature=0.0, use_panel=False)
+            msg, in_tok, out_tok = chat(messages, tools=schemas or None, temperature=0.0, use_panel=False)
         except Exception as exc:
             LOGGER.warning("decision_react_llm_failed: %s", exc)
             info["hops"] = hops
@@ -10067,6 +10742,25 @@ def _llm_decide_react(
 # ---------------------------------------------------------------------------
 
 
+def _fill_zero_priority(decision: dict, state: RoadGuardState) -> bool:
+    """Round 17: priority 0 from the model on a verdict that is not a sealed
+    catalogue image contradicts the severity check it was given (r10: a
+    needs_more_evidence at 0 while check_hazard_severity said 32). The
+    check's priority replaces it. Returns True when it did."""
+    if decision.get("action") == "known_image":
+        return False
+    try:
+        if int(decision.get("priority") or 0) != 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    sev = _severity_check_for_prompt(state.get("hazard_profile") or {}, state.get("metadata") or {})
+    if sev.get("already_run") and sev.get("priority") is not None:
+        decision["priority"] = int(sev["priority"])
+        return True
+    return False
+
+
 def _apply_evidence_cap(decision: dict, state: RoadGuardState) -> tuple[dict, bool]:
     """A second needs_more_evidence on a resumed run becomes human_review."""
     if decision["action"] != "needs_more_evidence":
@@ -10074,13 +10768,16 @@ def _apply_evidence_cap(decision: dict, state: RoadGuardState) -> tuple[dict, bo
     if int(state.get("evidence_round", 0) or 0) < MAX_EVIDENCE_REQUESTS_PER_HAZARD:
         return decision, False
     capped = dict(decision)
+    if MAX_EVIDENCE_REQUESTS_PER_HAZARD == 0:
+        why = "the reporter is not asked for more photos (policy), routed to human review"
+    else:
+        why = (
+            f"the evidence request cap ({MAX_EVIDENCE_REQUESTS_PER_HAZARD} per hazard) "
+            "is spent on this path, routed to human review"
+        )
     capped.update({
         "action": "human_review",
-        "rationale": (
-            f"ambiguous ({decision['rationale']}); the evidence request cap "
-            f"({MAX_EVIDENCE_REQUESTS_PER_HAZARD} per hazard) is spent on this path, "
-            "routed to human review"
-        ),
+        "rationale": f"ambiguous ({decision['rationale']}); {why}",
         "cited_sources": [],
         "missing_evidence": [],
     })
@@ -10174,6 +10871,11 @@ _NO_REPORTER_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _CATALOG_WORDS_RE = re.compile(r"\bcatalog(?:ue)?(?:d|ed)?\b", re.IGNORECASE)
+# Round 19 (3.11.2026): a phash neighbour pic_id in the model's text is a
+# citation of a DIFFERENT photo as evidence about this one. In r12
+# hz_472b131e8248 the rationale read "cataloged D00 crack is consistent"
+# on a phash neighbour, and the Decision cited pic_id in cited_sources.
+_PIC_ID_CITATION_RE = re.compile(r"\bpic[_\s]?id\s*[=:]\s*(\d+)", re.IGNORECASE)
 _LANE_BLOCKED_RE = re.compile(
     r"\b(lane (?:is )?(?:partially |fully )?blocked|blocking (?:the |a )?lane|blocks (?:the |a )?lane|"
     r"partial(?:ly)? block\w*|full(?:y)? block\w*|lane blockage|affects the vehicle path|in the (?:driving|vehicle) path)\b",
@@ -10220,7 +10922,10 @@ _NO_SEVERE_RE = re.compile(
 _SEVERE_RE = re.compile(r"\b(severe|critical|serious hazard|major hazard)\b", re.IGNORECASE)
 _CONF_WORD_RE = re.compile(
     r"\b(very low|low|moderate|medium|high|very high)[ -](?:detector|detection|model|yolo)[ -]confidence\b"
-    r"|\b(?:detector|detection|model|yolo) confidence(?: level)?(?: is| of| was|:)? (very low|low|moderate|medium|high|very high)\b",
+    r"|\b(?:detector|detection|model|yolo) confidence(?: level)?(?: is| of| was|:)? (very low|low|moderate|medium|high|very high)\b"
+    # Round 29 (6.11.2026 audit F9): "detected with high confidence" on a
+    # 0.00 detection passed the check in r23 (hz_18a448b99627).
+    r"|\bwith (very low|low|moderate|medium|high|very high) confidence\b",
     re.IGNORECASE,
 )
 _CONF_WORD_BAND = {"very low": "low", "low": "low", "moderate": "moderate", "medium": "moderate",
@@ -10256,7 +10961,7 @@ def _confidence_word_problems(text: str, conf) -> list[str]:
         return []
     found: list[str] = []
     for m in _CONF_WORD_RE.finditer(text):
-        word = (m.group(1) or m.group(2) or "").lower()
+        word = (m.group(1) or m.group(2) or m.group(3) or "").lower()
         word_band = _CONF_WORD_BAND.get(word)
         if word_band and word_band != band:
             found.append(f"confidence_word_{word.replace(' ', '_')}_vs_{float(conf):.2f}_{band}")
@@ -10299,6 +11004,17 @@ def _verify_decision_rationale(decision: dict, state: dict) -> dict:
             found.append("known_image_claim_without_sha256_match")
         elif _CATALOG_WORDS_RE.search(text) and not match:
             found.append("catalogue_claim_without_match")
+        # Round 19: a pic_id in the model's text is evidence about the
+        # catalogued image, not about this photo; only sha256 identity may
+        # carry a pic_id through to a verdict. In r12 hz_472b131e8248 the
+        # model wrote "pic_id=10179" as a supporting citation on a phash
+        # neighbour whose catalog label differed from the live detection.
+        if match and str(match.get("match") or "") != "sha256":
+            for m in _PIC_ID_CITATION_RE.finditer(text):
+                cited = m.group(1)
+                if str(cited) == str(match.get("pic_id") or ""):
+                    found.append(f"phash_neighbor_cited_as_evidence:pic_id={cited}")
+                    break
         foreign = sorted({c for c in _CLASS_CODE_RE.findall(text) if c not in allowed})
         if foreign:
             found.append("class_not_in_inputs:" + ",".join(foreign))
@@ -10326,6 +11042,11 @@ def _verify_decision_rationale(decision: dict, state: dict) -> dict:
         detail = state.get("research_coverage_detail") or {}
         if detail and not detail.get("repair_window") and _TIME_WINDOW_RE.search(text):
             found.append("repair_window_not_in_sources")
+        # Round 18 (2.11.2026): urgency words follow the same rule. In r11
+        # the model called a routine case "urgent dispatch recommended"
+        # while the retrieved standards contained no urgency wording.
+        if detail and not detail.get("urgency") and _URGENCY_WORDS_RE.search(text):
+            found.append("urgency_not_in_sources")
         return found
 
     # Round 13: each text is checked on its own, so the text that failed is
@@ -10340,6 +11061,168 @@ def _verify_decision_rationale(decision: dict, state: dict) -> dict:
         "rationale_problems": rationale_problems,
         "assessment_problems": assessment_problems,
     }
+
+
+def _scrub_state_on_fact_check_failure(state: dict, problems: list[str]) -> list[str]:
+    """Round 20 (3.11.2026): when a fact-check problem names an input the
+    inputs do not actually carry, clear the related state so no downstream
+    agent reads it back as truth. Returns the keys cleared, for the trace.
+
+    Round 24 (4.11.2026): also strip phash-driven labels from
+    ``dataset_match`` on ``phash_neighbor_cited_as_evidence`` so the
+    rule tree, work_order builder and approval email all read the same
+    neutralised block. The phash match itself (match / distance / pic_id)
+    stays for the audit; only the attributes that could influence a
+    verdict (classes, model_prediction, stored_confidence) are blanked.
+    """
+    cleared: list[str] = []
+    intake = state.get("reporter_intake") or {}
+    signals = state.get("reporter_signals") or {}
+    match = state.get("dataset_match") or {}
+    for p in problems or []:
+        if p == "reporter_claims_without_text":
+            if intake.get("mentioned"):
+                intake["mentioned"] = {"hazard_class": None, "lane_blocked": None, "road_type": None}
+                cleared.append("reporter_intake.mentioned")
+            if intake.get("urgency_claimed"):
+                intake["urgency_claimed"] = False
+                cleared.append("reporter_intake.urgency_claimed")
+            if any(v is not None for v in signals.values()):
+                for k in signals:
+                    signals[k] = None
+                cleared.append("reporter_signals")
+        elif p == "lane_blockage_not_in_form":
+            if (intake.get("mentioned") or {}).get("lane_blocked"):
+                intake["mentioned"]["lane_blocked"] = None
+                cleared.append("reporter_intake.mentioned.lane_blocked")
+        elif p.startswith("phash_neighbor_cited_as_evidence") and isinstance(match, dict):
+            # Round 24: phash-neighbour labels are evidence about a
+            # DIFFERENT photo. Once the model tried to cite them, we
+            # neutralise them so no downstream reader (rule tree,
+            # work_order, approval email) can use them either.
+            touched = False
+            if match.get("classes"):
+                match["classes"] = ""
+                touched = True
+            if match.get("model_prediction"):
+                match["model_prediction"] = None
+                touched = True
+            if match.get("stored_confidence") is not None:
+                match["stored_confidence"] = None
+                touched = True
+            if touched:
+                cleared.append("dataset_match.phash_labels")
+    if cleared:
+        state["reporter_intake"] = intake
+        state["reporter_signals"] = signals
+        if isinstance(match, dict):
+            state["dataset_match"] = match
+    return cleared
+
+
+# ---------------------------------------------------------------------------
+# Round 24 (4.11.2026): P0-A + P0-C helpers
+# ---------------------------------------------------------------------------
+# P0-A: PHASH never participates in evidence. _strip_phash_cited_sources
+# removes any cited_sources id that references the phash neighbour's
+# pic_id, so even when the LLM slipped one past the fact-check, the
+# approval row and the work_order see no phash-sourced id.
+# P0-C: YOLO + reporter-form inputs are immutable. _immutable_inputs_of
+# captures the four values every agent must treat as read-only
+# (yolo.top1_class, yolo.top1_confidence, md.lane_blocked, md.road_type)
+# so a validator or a drift check can compare against the original
+# values any time, with no agent able to overwrite them in state.
+
+
+def _strip_phash_cited_sources(decision: dict, state: dict) -> list[str]:
+    """Return the cited_sources with every phash-neighbour reference
+    removed. A pic_id from a non-sha256 match is never a valid citation
+    for this photo (see round 19's _PIC_ID_CITATION_RE); the deterministic
+    sentence stands on its own without it."""
+    match = state.get("dataset_match") or {}
+    cited = list(decision.get("cited_sources") or [])
+    if not cited:
+        return []
+    if str(match.get("match") or "") == "sha256":
+        return cited
+    pic_id = str(match.get("pic_id") or "")
+    if not pic_id:
+        return cited
+    out = []
+    for s in cited:
+        s_str = str(s)
+        if _PIC_ID_CITATION_RE.search(s_str) or pic_id in s_str:
+            continue
+        out.append(s)
+    return out
+
+
+def _immutable_inputs_of(state: dict) -> dict:
+    """Round 24 (4.11.2026): the four values every agent reads but may
+    not rewrite - the YOLO detector's live class and confidence, and the
+    reporter form's road type and lane_blocked. Captured at ingress on
+    ``state['_immutable_inputs']`` so a late-pipeline check can prove
+    nothing drifted."""
+    yolo = state.get("yolo_output") or {}
+    md = state.get("metadata") or {}
+    return {
+        "top1_class": str(yolo.get("top1_class") or ""),
+        "top1_confidence": yolo.get("top1_confidence"),
+        "road_type": str(md.get("road_type") or ""),
+        "lane_blocked": str(md.get("lane_blocked") or "none"),
+    }
+
+
+def _immutable_inputs_drift(state: dict) -> list[str]:
+    """Round 24: compare the live yolo_output + metadata against the
+    snapshot captured at ingress; return the keys that drifted."""
+    snap = state.get("_immutable_inputs")
+    if not isinstance(snap, dict):
+        return []
+    now = _immutable_inputs_of(state)
+    drifted = []
+    for k, v in snap.items():
+        if now.get(k) != v:
+            drifted.append(k)
+    return drifted
+
+
+def _removed_claims_note(problems: list[str]) -> str:
+    """Round 19: a one-line note the operator sees under the deterministic
+    sentence, naming the kinds of claim the fact-check removed from the
+    model's text."""
+    kinds: list[str] = []
+    for p in problems or []:
+        if p.startswith("phash_neighbor_cited_as_evidence"):
+            kinds.append("a phash-neighbour pic_id as evidence")
+        elif p == "reporter_claims_without_text":
+            kinds.append("claims attributed to a reporter who sent no text")
+        elif p == "lane_blockage_not_in_form":
+            kinds.append("a lane blockage the form does not state")
+        elif p.startswith("lane_free_claim_but_form_says_"):
+            kinds.append("a lane-free claim that contradicts the form")
+        elif p == "known_image_claim_without_sha256_match":
+            kinds.append("a known-image claim without a sha256 match")
+        elif p == "catalogue_claim_without_match":
+            kinds.append("a catalogue claim without any match")
+        elif p == "repair_window_not_in_sources":
+            kinds.append("a repair window the retrieved standards do not state")
+        elif p == "urgency_not_in_sources":
+            kinds.append("an urgency the retrieved standards do not state")
+        elif p.startswith("class_not_in_inputs:"):
+            kinds.append("class codes not present in the inputs")
+        elif p.startswith("class_name_mismatch:"):
+            kinds.append("a code paired with another class's name")
+        elif p.startswith("severity_text_"):
+            kinds.append("severity wording that contradicts the profile")
+        elif p.startswith("confidence_word_"):
+            kinds.append("a confidence band that contradicts the number")
+    if not kinds:
+        return ""
+    # Keep unique order of first appearance.
+    seen: set[str] = set()
+    uniq = [k for k in kinds if not (k in seen or seen.add(k))]
+    return "(note: the fact-check removed from the model's text " + "; ".join(uniq[:4]) + ".)"
 
 
 def _deterministic_rationale(decision: dict, state: dict) -> str:
@@ -10370,6 +11253,12 @@ def _deterministic_rationale(decision: dict, state: dict) -> str:
         detail = state.get("research_coverage_detail") or {}
         if detail.get("sufficiency"):
             cov += f", {detail['sufficiency']}"
+            # Round 21 (3.11.2026): the operator always sees in words what
+            # the standards did NOT answer, so no assessment carries an
+            # unverifiable repair window or urgency note by omission.
+            missing = detail.get("missing") or []
+            if detail.get("sufficiency") == "insufficient_coverage" and missing:
+                cov += f" (standards did not answer: {','.join(missing)})"
         bits.append(cov)
     intake = state.get("reporter_intake") or {}
     bits.append("reporter text present" if intake.get("text") else "no reporter text")
@@ -10442,6 +11331,7 @@ _PROBLEM_SENTENCES = {
     "lane_blockage_not_in_form": "the form says lane_blocked=none and no input states a lane blockage",
     "known_image_claim_without_sha256_match": "this photo is not a catalogued file (no sha256 match)",
     "catalogue_claim_without_match": "no catalogue match exists for this photo",
+    "phash_neighbor_cited_as_evidence": "the catalogued pic_id is a DIFFERENT photo found by perceptual-hash similarity; it is not evidence about this photo's class or verdict",
     "repair_window_not_in_sources": "the retrieved standards state no repair window or deadline; do not state one",
     "severity_text_minor_vs_profile_severe": "the profile's severity_signal is severe; your text says the opposite",
     "severity_text_severe_vs_profile_minor": "the profile's severity_signal is minor; your text says severe",
@@ -10453,6 +11343,9 @@ def _problem_sentences(problems: list[str], state: dict) -> list[str]:
     profile = state.get("hazard_profile") or {}
     out: list[str] = []
     for p in problems:
+        if p.startswith("phash_neighbor_cited_as_evidence"):
+            out.append(_PROBLEM_SENTENCES["phash_neighbor_cited_as_evidence"])
+            continue
         if p in _PROBLEM_SENTENCES:
             out.append(_PROBLEM_SENTENCES[p])
         elif p.startswith("lane_free_claim_but_form_says_"):
@@ -10595,6 +11488,7 @@ def decision_node(state: RoadGuardState) -> dict:
     # waiting on the local model for a verdict that is already decided
     # ties up a concurrency slot for 60-120 s per upload.
     declined_decision: dict | None = None
+    catalog_sealed = False
     if state.get("evidence_declined"):
         # Round 17: the reporter re-sent the original photo with a note; no
         # new evidence, no second model pass, a human decides.
@@ -10612,9 +11506,14 @@ def decision_node(state: RoadGuardState) -> dict:
             "missing_evidence": [],
         }
     elif state.get("dataset_match") and rule_hint["action"] in ("known_image", "human_review"):
+        # Round 18 (2.11.2026): a catalogued image seals the verdict without
+        # calling the LLM; the fallback_reason label was misleading in r11
+        # (43 of 94 cases carried llm_unavailable_or_unparseable although
+        # Decision never called the model). Marked as catalog_match instead.
         llm_decision = None
         in_tok = out_tok = 0
         react_info = None
+        catalog_sealed = True
     else:
         react_info = None
         if _react_enabled():
@@ -10680,6 +11579,33 @@ def decision_node(state: RoadGuardState) -> dict:
     elif declined_decision is not None:
         decision = declined_decision
         fallback_reason = "evidence_declined"
+    elif catalog_sealed:
+        # Round 18: the catalog match is the authoritative verdict; no LLM
+        # call to label as a fallback. source=catalog_match on the trace line.
+        source = "catalog_match"
+        last_error = ""
+        for _ in range(MAX_GROUNDING_RETRIES):
+            candidate = _decide_rule_based(state)
+            try:
+                assert_decision_grounded(
+                    cited_sources=candidate["cited_sources"],
+                    tool_result_ids=tool_result_ids,
+                    action=candidate["action"],
+                )
+                decision = candidate
+                break
+            except HandoffAssertionError as e:
+                last_error = str(e)
+                continue
+        else:
+            fallback_reason = f"grounding_failed_after_{MAX_GROUNDING_RETRIES}_retries"
+            decision = {
+                "action": "human_review",
+                "rationale": f"grounding failed after {MAX_GROUNDING_RETRIES} retries: {last_error}",
+                "priority": 50,
+                "cited_sources": [],
+                "missing_evidence": [],
+            }
     else:
         fallback_reason = _llm_fallback_reason(react_info)
         last_error = ""
@@ -10736,16 +11662,8 @@ def decision_node(state: RoadGuardState) -> dict:
     # catalogue image contradicts the severity check it was given (r10: a
     # needs_more_evidence at 0 while check_hazard_severity said 32).
     priority_from_check = False
-    if (
-        llm_decision is not None
-        and overridden_llm_verdict is None
-        and decision.get("action") != "known_image"
-        and int(decision.get("priority") or 0) == 0
-    ):
-        sev = _severity_check_for_prompt(state.get("hazard_profile") or {}, state.get("metadata") or {})
-        if sev.get("already_run") and sev.get("priority") is not None:
-            decision["priority"] = int(sev["priority"])
-            priority_from_check = True
+    if llm_decision is not None and overridden_llm_verdict is None:
+        priority_from_check = _fill_zero_priority(decision, state)
     decision, cap_applied = _apply_evidence_cap(decision, state)
     # Round 11: the model's own rationale is checked against the inputs;
     # a rationale that states something the inputs do not carry is
@@ -10775,18 +11693,56 @@ def decision_node(state: RoadGuardState) -> dict:
                 recheck = _verify_decision_rationale(corrected, state)
                 correction["recheck_ok"] = recheck["ok"]
                 decision = corrected
+                # Round 29 (6.11.2026 audit F16): the corrected reply may
+                # carry priority 0 again; the severity check fills it as
+                # it did for the first reply (r23 hz_a7a8f0c54b02 kept 0
+                # while the trace said priority_from=severity_check).
+                if _fill_zero_priority(decision, state):
+                    priority_from_check = True
                 rationale_check = recheck
                 if recheck["ok"]:
                     rationale_check["corrected"] = True
             rationale_check["correction"] = correction
             if not rationale_check["ok"]:
+                # Round 20: scrub the state fields the failed claims were
+                # about, so no downstream agent reads them back as truth.
+                scrubbed = _scrub_state_on_fact_check_failure(state, rationale_check["problems"])
+                if scrubbed:
+                    rationale_check["state_scrubbed"] = scrubbed
+                # Round 24 (4.11.2026) P0-A: on phash_neighbor_cited_as_
+                # evidence the model's cited_sources list is cleaned of
+                # any id that referenced the phash neighbour, so the
+                # work_order and the approval row cannot carry that id.
+                any_phash_prob = any(
+                    p.startswith("phash_neighbor_cited_as_evidence")
+                    for p in (rationale_check.get("problems") or [])
+                )
+                if any_phash_prob:
+                    before = list(decision.get("cited_sources") or [])
+                    after = _strip_phash_cited_sources(decision, state)
+                    if after != before:
+                        rationale_check.setdefault("state_scrubbed", []).append(
+                            "decision.cited_sources.phash"
+                        )
+                        decision["cited_sources"] = after
                 sentence = _deterministic_rationale(decision, state)
+                # Round 19 (3.11.2026): the operator sees the clean sentence
+                # and the one-line note of what the fact-check removed; the
+                # whole model text stays on rationale_check for the audit.
+                removed_note = _removed_claims_note(rationale_check["problems"])
                 if rationale_check.get("rationale_problems"):
                     rationale_check["model_rationale"] = str(decision.get("rationale") or "")[:500]
-                    decision["rationale"] = sentence
+                    decision["rationale"] = (sentence + " " + removed_note).strip()[:500]
                 if rationale_check.get("assessment_problems"):
                     rationale_check["model_assessment"] = str(decision.get("assessment") or "")[:500]
-                    decision["assessment"] = sentence
+                    decision["assessment"] = (sentence + " " + removed_note).strip()[:400]
+                # Round 24 (4.11.2026) P0-B: mark explicitly that the
+                # model's text was rejected and the deterministic
+                # sentence is the ONLY active text downstream readers
+                # (approval email, work_order, supervisor digest) may
+                # use. The model's original stays on rationale_check
+                # for the audit, flagged as not-for-display.
+                rationale_check["rejected_text_hard_blocked"] = True
                 enforcement = _enforce_unverified(decision, rule_hint)
                 rationale_check["enforcement"] = enforcement["kind"]
                 rationale_check["enforcement_why"] = enforcement["why"]
@@ -10851,7 +11807,95 @@ def decision_node(state: RoadGuardState) -> dict:
             }
         decision["missing_evidence"] = [evidence_request["missing_field"]]
 
+    # Round 25 (4.11.2026) P1 - RAG enforcement. When the RAG retriever
+    # flagged insufficient_coverage, the standards do NOT answer the
+    # Decision questions; a verdict of standard is a leap the sources
+    # do not support. The owner's rule: "אם חסר מידע קריטי, Decision
+    # לא ישלים אותו באמצעות ניחוש. הוא יבחר בין בקשת ראיות נוספות
+    # לבין בדיקה אנושית". A standard verdict on insufficient_coverage
+    # is upgraded to needs_more_evidence (or human_review if the
+    # severity signal is severe).
+    rag_override: dict | None = None
+    research_detail = state.get("research_coverage_detail") or {}
+    if (
+        research_detail.get("sufficiency") == "insufficient_coverage"
+        and decision.get("action") == "standard"
+        and source == "llm_react"
+        and not state.get("dataset_match")
+    ):
+        severity = str(((state.get("hazard_profile") or {}).get("severity_signal")) or "").lower()
+        # 6.11.2026 (owner): the reporter is never asked for another photo;
+        # a standard the sources do not support goes to a human.
+        upgrade_to = "human_review"
+        rag_override = {
+            "pre_override_action": decision.get("action"),
+            "pre_override_priority": decision.get("priority"),
+            "reason": "rag_insufficient_coverage_standard_leap",
+            "missing": list(research_detail.get("missing") or [])[:6],
+            "upgrade_to": upgrade_to,
+        }
+        decision = {
+            **decision,
+            "action": upgrade_to,
+            "priority": max(int(decision.get("priority") or 0), 55),
+            "rationale": (
+                f"RAG floor: the retrieved standards did not answer "
+                f"{', '.join(rag_override['missing']) or 'the decision questions'}; "
+                f"standard is a leap. Routed to a human (severity={severity or 'n/a'})."
+            )[:500],
+            "floor_reason": "rag_insufficient_coverage",
+            "floor_trigger": ",".join(rag_override["missing"]) or "insufficient_coverage",
+        }
+        source = "rule_based"
+
+    # Round 25 (4.11.2026) P1 - Supervisor consistency enforcement. If
+    # the Supervisor flagged a safety concern and set force_action=
+    # "human_review", the Decision LLM must not land on standard /
+    # needs_more_evidence. The owner's words: "Supervisor צריך לאכוף
+    # את גבולות ההחלטה. ה-LLM רשאי להציע החלטה, אבל לא לעקוף תנאי
+    # בטיחות". The upgrade runs even when AGENT_SUPERVISOR_ROUTING is
+    # off, since the LLM may have reasoned the ambiguity away without
+    # grounding; the deterministic rule tree wins on safety.
+    supervisor_plan = state.get("supervisor_plan") or {}
+    sup_force = str((supervisor_plan or {}).get("force_action") or "").strip().lower()
+    supervisor_override: dict | None = None
+    if sup_force == "human_review" and decision.get("action") not in {"human_review", "urgent"}:
+        supervisor_override = {
+            "pre_override_action": decision.get("action"),
+            "pre_override_priority": decision.get("priority"),
+            "reason": "supervisor_force_action_human_review",
+            "note": str((supervisor_plan or {}).get("note") or "")[:240],
+        }
+        decision = {
+            **decision,
+            "action": "human_review",
+            "priority": max(int(decision.get("priority") or 0), 50),
+            "rationale": (
+                f"supervisor safety floor: {supervisor_override['note'] or 'pipeline_concern raised'}; "
+                f"model proposed {supervisor_override['pre_override_action']} but could not clear the concern"
+            )[:500],
+            "floor_reason": "supervisor_force_action",
+            "floor_trigger": supervisor_override["note"],
+        }
+        source = "rule_based"
+
     trace_content = {**decision, "source": source}
+    if supervisor_override is not None:
+        trace_content["floor_applied"] = True
+        trace_content["overridden_llm_verdict"] = {
+            "action": supervisor_override["pre_override_action"],
+            "priority": supervisor_override["pre_override_priority"],
+            "rationale": "",
+            "cited_sources": [],
+        }
+    elif rag_override is not None:
+        trace_content["floor_applied"] = True
+        trace_content["overridden_llm_verdict"] = {
+            "action": rag_override["pre_override_action"],
+            "priority": rag_override["pre_override_priority"],
+            "rationale": "",
+            "cited_sources": [],
+        }
     if fallback_reason:
         # Round 10 (1.11.2026): the reason was on the state and in the log,
         # not in the stored trace; the formatter already prints it.
@@ -11715,9 +12759,14 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
                 f"  answers={','.join(dc.get('answered') or []) or 'none'}"
                 f"  missing={','.join(dc.get('missing') or []) or 'none'}"
             ) + (f"  sufficiency={dc['sufficiency']}" if dc.get("sufficiency") else "")
+        # Round 19 (3.11.2026): topic and sufficient are two separate axes;
+        # the operator sees both on the trace line so direct_match does not
+        # read as "the standards answer the operational questions".
+        sufficient_word = "yes" if (dc or {}).get("sufficiency") == "sufficient_coverage" else "no"
         out.append(
             f"{lbl} query_repair_standards -> {c.get('n_procedures', len(ids))} passages  "
-            f"coverage={c.get('coverage')}{cov_bits}  llm_used={c.get('llm_used')}" + _worker_flags(c)
+            f"topic={c.get('coverage')}  sufficient={sufficient_word}{cov_bits}  "
+            f"llm_used={c.get('llm_used')}" + _worker_flags(c)
         )
         # 27.10.2026 trace enrichment: show what was actually asked and what
         # came back. _short limits grew to 400+ so a passage preview up to
@@ -11773,6 +12822,8 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
             decision_flags += f"  tool_failures={n_tool_failures}"
         if react_rec.get("final_in_tool_call"):
             decision_flags += "  reply_via=tool_call"
+        if react_rec.get("tools_offered") == 0:
+            decision_flags += "  tools_offered=0"
         if c.get("priority_from_severity_check"):
             decision_flags += "  priority_from=severity_check"
         rc_flag = c.get("rationale_check") if isinstance(c.get("rationale_check"), dict) else {}
@@ -11875,7 +12926,10 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
                 else:
                     out.append(f"{_INDENT}rationale check: ok")
             else:
-                tail = "deterministic sentence shown, model text below"
+                # Round 21 (3.11.2026): the operator reads ONE clean
+                # sentence. The model's rejected text is kept on the
+                # stored rationale_check for the audit, not printed here.
+                tail = "deterministic sentence shown (model text kept on rationale_check for the audit)"
                 if corr:
                     tail = f"correction round {corr.get('status')}; " + tail
                 enforcement = rc.get("enforcement")
@@ -11886,13 +12940,14 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
                     )
                 elif enforcement == "kept":
                     tail += "; verdict kept (not more severe than the rule tree)"
+                if rc.get("state_scrubbed"):
+                    tail += f"; state_scrubbed={','.join(rc['state_scrubbed'])}"
                 out.append(
                     f"{_INDENT}rationale check: FAIL ({', '.join(rc.get('problems') or [])}); {tail}"
                 )
-                if rc.get("model_rationale"):
-                    out.append(f"{_INDENT}  model rationale: {_short(rc['model_rationale'], 400)}")
-                if rc.get("model_assessment"):
-                    out.append(f"{_INDENT}  model assessment: {_short(rc['model_assessment'], 400)}")
+                # Round 21: the operator trace does not print the rejected
+                # model text; it stays on rc['model_rationale'] and
+                # rc['model_assessment'] for the auditor.
         cited = [str(x) for x in (c.get("cited_sources") or [])]
         out.append(f"{_INDENT}cited_sources={cited}")
         # 27.10.2026 trace enrichment: per-source grounding breakdown so
@@ -11941,7 +12996,10 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
         elif c.get("missing_evidence"):
             out.append(f"{_INDENT}missing_evidence={c['missing_evidence']}")
         if c.get("evidence_cap_applied"):
-            out.append(f"{_INDENT}evidence cap reached: one request per hazard")
+            out.append(
+                f"{_INDENT}evidence cap reached: {MAX_EVIDENCE_REQUESTS_PER_HAZARD} request(s) per hazard; "
+                "needs_more_evidence became human_review"
+            )
         # 27.10.2026 trace enrichment: expose model fallback error so a
         # degraded LLM call is visible in the trace, not only in the
         # internal llm_summary blob. ok_calls=0 + failed_calls>0 means
@@ -12073,8 +13131,18 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
             line += f"  time={float(auto['time_used_s']):.0f}s/{float(cap):.0f}s" if cap else f"  time={float(auto['time_used_s']):.0f}s"
             if auto.get("cut_by_cap"):
                 line += " (cut by cap)"
-        if auto.get("source"):
-            line += f"  source={auto['source']}"
+        # Round 20 (3.11.2026): the autonomy source is always visible: a line
+        # that reads auto_ran=X without an agent-called hop is a
+        # deterministic fallback, not autonomy; /stats/agents separates the
+        # two channels on this label.
+        source_tag = auto.get("source")
+        if not source_tag:
+            if int(auto.get("hops") or 0) > 0 and auto.get("tools_used"):
+                source_tag = "agent_choice"
+            elif auto.get("auto_ran"):
+                source_tag = "deterministic_fallback"
+        if source_tag:
+            line += f"  source={source_tag}"
         line += f"  violations={violations}"
         out.append(line)
     ts = entry.get("ts")
@@ -12084,6 +13152,403 @@ def _entry_lines(entry: dict, tool_ids: list[str]) -> list[str]:
         # content: _clock() is now "YYYY-MM-DD HH:MM:SS" (19) + 1 space = 20.
         out[1:] = [f"{' ' * 20}{ln}" for ln in out[1:]]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Round 22 (4.11.2026): agent value per case
+# ---------------------------------------------------------------------------
+# The LLM / agent work only earns its compute when its verdict differs from
+# what the deterministic rule tree alone would have produced AND that
+# difference is in the right direction. This block exposes the per-case
+# comparison as:
+#   * a compact JSON written to hazards.agent_value_json (queryable column)
+#   * one line appended to format_trace_lines' footer (operator trace)
+#   * the aggregate counters the API's /stats/agents panel adds up
+# Reads only the trace that the agent already produces; adds no new state
+# and is safe to run against runs from earlier rounds (missing fields come
+# back None/False).
+
+
+# ---------------------------------------------------------------------------
+# Round 23 (4.11.2026): per-agent justification, per-run cost, per-agent
+# behaviour metrics -- and "advantage over rule tree / human".
+# ---------------------------------------------------------------------------
+# Owner's demand: every image lands with a yes/no per agent + a reason
+# per yes, then at the end of a run show the total tokens and compute, how
+# accurate each agent was, and WHICH cases the agents outperformed the
+# rule tree or the human. Every number is read from the trace the agent
+# already writes and the approvals the human already decided.
+
+_COMMERCIAL_LLM_PRICE_PER_1K_IN = 0.0003   # Groq llama-3-8B equivalent input
+_COMMERCIAL_LLM_PRICE_PER_1K_OUT = 0.0006  # Groq llama-3-8B equivalent output
+
+
+def _agent_entries_by_speaker(trace: list[dict]) -> dict[str, list[dict]]:
+    """Group content dicts from a run's trace by their speaker. Keeps the
+    full order so a caller inspects the first/last entry per speaker."""
+    bucket: dict[str, list[dict]] = {}
+    for entry in trace or []:
+        if not isinstance(entry, dict):
+            continue
+        sp = str(entry.get("speaker") or "")
+        c = entry.get("content") if isinstance(entry.get("content"), dict) else None
+        if not sp or not c:
+            continue
+        bucket.setdefault(sp, []).append(entry)
+    return bucket
+
+
+def _justify_sanitize(contents: list[dict]) -> dict:
+    reasons: list[str] = []
+    for c in contents:
+        if c.get("location_scrubbed"):
+            reasons.append("location_scrubbed")
+        if c.get("ocr_suspicious"):
+            reasons.append("ocr_injection_blocked")
+        if c.get("reporter_text_suspicious"):
+            reasons.append("reporter_text_filtered")
+    return {"ran": bool(contents), "justified": bool(reasons),
+            "reasons": reasons or (["nothing_to_scrub"] if contents else ["did_not_run"])}
+
+
+def _justify_signal_extractor(contents: list[dict]) -> dict:
+    if not contents:
+        return {"ran": False, "justified": False, "reasons": ["did_not_run"]}
+    reasons: list[str] = []
+    for c in contents:
+        if not c.get("has_text"):
+            continue
+        m = c.get("mentioned") or {}
+        if any(m.get(k) for k in ("hazard_class", "lane_blocked", "road_type")):
+            reasons.append("extracted_claims_from_text")
+        if c.get("urgency_claimed"):
+            reasons.append("detected_urgency")
+        signals = {k: v for k, v in (c.get("reporter_signals") or {}).items()
+                   if v not in (None, "", [], False)}
+        if signals:
+            reasons.append("extracted_numeric_signals")
+        if c.get("contradictions"):
+            reasons.append("caught_contradiction")
+    if not reasons:
+        reasons = ["no_reporter_text"] if not any(c.get("has_text") for c in contents) else ["llm_claims_dropped"]
+    return {"ran": True, "justified": any(
+        r for r in reasons if r not in ("no_reporter_text", "llm_claims_dropped", "did_not_run")),
+            "reasons": reasons}
+
+
+def _justify_supervisor(contents: list[dict]) -> dict:
+    if not contents:
+        return {"ran": False, "justified": False, "reasons": ["did_not_run"]}
+    reasons: list[str] = []
+    for c in contents:
+        concern = str(c.get("pipeline_concern") or "")
+        if concern and concern != "none":
+            reasons.append(f"flagged_{concern}")
+        if c.get("force_action"):
+            reasons.append(f"forced_action_{c['force_action']}")
+    return {"ran": True, "justified": bool(reasons),
+            "reasons": reasons or ["no_concern_raised"]}
+
+
+def _tool_result_informative(result) -> bool:
+    """Round 29 (6.11.2026 audit F18): a tool call counts as agent value
+    only when it returned something. In r23 lookup_similar_cases answered
+    0 cases in 91 of 91 calls and recall_agent_notes 0 lessons in 48 of
+    48, and every such run was still marked agent_reasoned_with_tools."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return bool(result.strip())
+    if not isinstance(result, dict):
+        return bool(result)
+    if result.get("ok") is False:
+        return False
+    for key in ("found", "has_prior_reports", "count", "n"):
+        if key in result:
+            return bool(result[key])
+    for key in ("cases", "lessons", "procedures", "tool_result_ids"):
+        if key in result:
+            return bool(result[key])
+    rest = {k: v for k, v in result.items() if k not in ("ok", "tool", "note", "why", "error")}
+    return any(v not in (None, False, "", [], {}) for v in rest.values())
+
+
+def _any_informative_tool_result(contents: list[dict]) -> bool:
+    """True when at least one recorded tool step of the worker returned
+    something (the react_step entries carry the tool name and result)."""
+    return any(
+        _tool_result_informative(c.get("result"))
+        for c in contents
+        if isinstance(c, dict) and c.get("tool") and "result" in c
+    )
+
+
+def _justify_profile_builder(contents: list[dict]) -> dict:
+    if not contents:
+        return {"ran": False, "justified": False, "reasons": ["did_not_run"]}
+    reasons: list[str] = []
+    rebuttals: list[str] = []
+    for c in contents:
+        dl = c.get("dataset_lookup") or {}
+        if isinstance(dl, dict) and dl.get("found"):
+            reasons.append("catalogue_hit")
+        delta = c.get("llm_delta") or {}
+        if c.get("llm_used") and delta:
+            auto = c.get("autonomy") or {}
+            viol = list(auto.get("violations") or [])
+            blocked = [v for v in viol if "severity_blocked_" in str(v)]
+            if blocked:
+                rebuttals.extend(blocked)
+            else:
+                reasons.append("severity_moved_with_signal")
+        auto = c.get("autonomy") or {}
+        if int(auto.get("hops") or 0) > 0 and auto.get("tools_used"):
+            if _any_informative_tool_result(contents):
+                reasons.append("agent_reasoned_with_tools")
+            else:
+                rebuttals.append("tools_returned_nothing")
+    return {"ran": True, "justified": bool(reasons),
+            "reasons": reasons or (["llm_blocked_by_gate"] if rebuttals and "tools_returned_nothing" not in rebuttals else (["tools_returned_nothing"] if rebuttals else ["no_signal_added"])),
+            "rebuttals": rebuttals}
+
+
+def _justify_rag_retriever(contents: list[dict]) -> dict:
+    if not contents:
+        return {"ran": False, "justified": False, "reasons": ["did_not_run"]}
+    reasons: list[str] = []
+    for c in contents:
+        coverage = str(c.get("coverage") or "")
+        n = int(c.get("n_procedures") or 0)
+        dc = c.get("decision_coverage") if isinstance(c.get("decision_coverage"), dict) else {}
+        suff = str((dc or {}).get("sufficiency") or "")
+        if coverage == "direct_match" and n >= 1:
+            reasons.append("direct_match_retrieved")
+        if suff == "sufficient_coverage":
+            reasons.append("sufficient_coverage")
+        auto = c.get("autonomy") or {}
+        if int(auto.get("hops") or 0) > 0 and auto.get("tools_used") and _any_informative_tool_result(contents):
+            reasons.append("agent_chose_queries")
+    return {"ran": True, "justified": bool(reasons),
+            "reasons": reasons or ["no_relevant_passages"]}
+
+
+def _justify_decision(contents: list[dict], summary: dict | None) -> dict:
+    if not contents or not summary:
+        return {"ran": bool(contents), "justified": False,
+                "reasons": ["did_not_run"] if not contents else ["no_summary"]}
+    reasons: list[str] = []
+    final = None
+    for e in contents:
+        if e.get("kind") == "final":
+            final = e.get("content") or {}
+    final = final or {}
+    rc = final.get("rationale_check") if isinstance(final.get("rationale_check"), dict) else {}
+    cited = final.get("cited_sources") or []
+    source = str(final.get("source") or "")
+    if summary.get("changed_rule_hint"):
+        reasons.append("workers_moved_rule_tree")
+    if source == "llm_react" and rc.get("ok") and cited:
+        reasons.append("grounded_rationale_vs_rule_tree")
+    if rc.get("enforcement") == "kept":
+        reasons.append("llm_verdict_stood_on_fact_check")
+    if final.get("floor_applied"):
+        reasons.append(f"floor_caught_llm:{final.get('floor_reason') or 'unnamed'}")
+    rebuttals: list[str] = []
+    if rc.get("enforcement") == "rule_tree_verdict":
+        rebuttals.append("llm_overridden_by_tree")
+    if source == "rule_based":
+        rebuttals.append("llm_fell_back_to_tree")
+    if source == "catalog_match":
+        rebuttals.append("catalogue_short_circuit")
+    return {"ran": True, "justified": bool(reasons),
+            "reasons": reasons or (rebuttals or ["no_added_value"]),
+            "rebuttals": rebuttals}
+
+
+def _compute_per_agent_justification(trace: list[dict] | None,
+                                     summary: dict | None) -> dict[str, dict]:
+    """Per-agent yes/no + reason list for one case. The owner reads this
+    at the end of every image in the trace: did Sanitize earn its hop?
+    did Signal Extractor earn its LLM? did Decision outperform the tree?"""
+    if not isinstance(trace, list):
+        return {}
+    by = _agent_entries_by_speaker(trace)
+    # Order the owner expects in the footer.
+    out: dict[str, dict] = {}
+    for sp, fn in (
+        ("sanitize",         _justify_sanitize),
+        ("signal_extractor", _justify_signal_extractor),
+        ("supervisor",       _justify_supervisor),
+        ("profile_builder",  _justify_profile_builder),
+        ("rag_retriever",    _justify_rag_retriever),
+    ):
+        contents = [e.get("content") or {} for e in by.get(sp, [])]
+        out[sp] = fn(contents)
+    out["decision"] = _justify_decision(by.get("decision", []) or [], summary)
+    return out
+
+
+def _compute_run_cost(trace: list[dict] | None) -> dict:
+    """Total LLM calls + tokens + wall-seconds for one case's trace, plus
+    two cost columns: Ollama self-hosted (free on the VM today) and the
+    equivalent cost if the same tokens went to a commercial API (Groq
+    llama-3-8B pricing, Nov 2026; swap for Settings.commercial_price_*
+    later). CPU seconds are not available from the trace alone and are
+    reported as None."""
+    calls = tok_in = tok_out = 0
+    stamps: list[float] = []
+    for e in trace or []:
+        if not isinstance(e, dict):
+            continue
+        c = e.get("content") if isinstance(e.get("content"), dict) else None
+        if not c:
+            continue
+        if e.get("ts"):
+            try:
+                stamps.append(float(e["ts"]))
+            except (TypeError, ValueError):
+                pass
+        llm = c.get("llm")
+        if isinstance(llm, dict):
+            calls += int(llm.get("calls") or 0)
+            tok_in += int(llm.get("tokens_in") or 0)
+            tok_out += int(llm.get("tokens_out") or 0)
+    wall = (max(stamps) - min(stamps)) if len(stamps) >= 2 else 0.0
+    commercial = (
+        (tok_in / 1000.0) * _COMMERCIAL_LLM_PRICE_PER_1K_IN
+        + (tok_out / 1000.0) * _COMMERCIAL_LLM_PRICE_PER_1K_OUT
+    )
+    return {
+        "llm_calls": calls,
+        "tokens_in": tok_in,
+        "tokens_out": tok_out,
+        "wall_seconds": round(wall, 2),
+        "cost_self_hosted_usd": 0.0,
+        "cost_commercial_equivalent_usd": round(commercial, 6),
+    }
+
+
+def _compute_per_agent_behavior(trace: list[dict] | None) -> dict[str, dict]:
+    """Per-agent behaviour counters for ONE case: how many hops, tools,
+    violations, fact-check failures. Aggregated across a round by
+    _aggregate_agent_metrics; here it just records the per-case view
+    that the trace footer can print."""
+    if not isinstance(trace, list):
+        return {}
+    by = _agent_entries_by_speaker(trace)
+    out: dict[str, dict] = {}
+    for sp, contents in by.items():
+        auto_hops = sum(int((c.get("content") or {}).get("autonomy", {}).get("hops") or 0) for c in contents)
+        tools = sum(len((c.get("content") or {}).get("autonomy", {}).get("tools_used") or []) for c in contents)
+        violations = sum(len((c.get("content") or {}).get("autonomy", {}).get("violations") or []) for c in contents)
+        llm_used = any((c.get("content") or {}).get("llm_used") for c in contents)
+        out[sp] = {"hops": auto_hops, "tools_used": tools,
+                   "violations": violations, "llm_used": bool(llm_used)}
+    return out
+
+
+def _build_agent_value_summary(trace: list[dict] | None) -> dict | None:
+    """Per-case 'did the agent change the rule tree's verdict' summary.
+
+    Returns None when the trace carries no Decision final (queued /
+    processing / broken run). Otherwise returns a flat dict keyed as:
+        rule_tree_action                - what the rule tree alone would
+                                          have produced (no worker LLMs);
+                                          falls back to final_action when
+                                          the Decision ran through a path
+                                          that captures no worker baseline
+                                          (catalog_match, LLM off).
+        rule_tree_with_worker_action    - the rule_hint Decision received
+                                          (= rule tree after worker LLMs
+                                          moved the signals).
+        llm_proposed_action             - the Decision LLM's verdict before
+                                          any floor; None when Decision ran
+                                          rule_based or a floor did not fire.
+        final_action                    - the row's agent_decision.
+        changed_rule_hint               - worker LLMs changed the rule tree's
+                                          verdict (True/False/None).
+        profile_llm_changed             - the profile worker's LLM labels
+                                          moved the rule tree.
+        research_llm_changed            - the RAG worker's LLM coverage moved
+                                          the rule tree.
+        decision_source                 - rule_based | llm_react |
+                                          catalog_match | None.
+        floor_applied                   - a deterministic floor fired on
+                                          top of (or instead of) the LLM.
+        floor_reason                    - the floor's short slug.
+        enforcement                     - "rule_tree_verdict" (LLM overridden
+                                          because it was more severe),
+                                          "kept" (LLM verdict stood even
+                                          though the fact-check flagged it),
+                                          or None.
+    """
+    if not isinstance(trace, list):
+        return None
+    final = None
+    for e in trace:
+        if isinstance(e, dict) and e.get("speaker") == "decision" and e.get("kind") == "final":
+            final = e.get("content") if isinstance(e.get("content"), dict) else None
+    if not isinstance(final, dict):
+        return None
+    wi = final.get("worker_impact") if isinstance(final.get("worker_impact"), dict) else {}
+    rc = final.get("rationale_check") if isinstance(final.get("rationale_check"), dict) else {}
+    ov = final.get("overridden_llm_verdict") if isinstance(final.get("overridden_llm_verdict"), dict) else {}
+    final_action = final.get("action")
+    rule_tree_action = wi.get("rule_hint_without_worker_llm") or final_action
+    rule_tree_with_worker_action = wi.get("rule_hint_with_worker_llm") or final_action
+    source = final.get("source")
+    if ov.get("action"):
+        llm_proposed = ov.get("action")
+    elif source == "llm_react":
+        llm_proposed = final_action
+    else:
+        llm_proposed = None
+    enforcement = rc.get("enforcement") if isinstance(rc, dict) else None
+    base = {
+        "rule_tree_action": rule_tree_action,
+        "rule_tree_with_worker_action": rule_tree_with_worker_action,
+        "llm_proposed_action": llm_proposed,
+        "final_action": final_action,
+        "changed_rule_hint": bool(wi.get("changed_rule_hint")) if wi else None,
+        "profile_llm_changed": bool(wi.get("profile_llm_changed")) if wi else None,
+        "research_llm_changed": bool(wi.get("research_llm_changed")) if wi else None,
+        "decision_source": source,
+        "floor_applied": bool(final.get("floor_applied")),
+        "floor_reason": final.get("floor_reason") or None,
+        "enforcement": enforcement,
+    }
+    # Round 23 (4.11.2026): per-agent justification + run cost attached
+    # to the same summary blob so the DB column and the trace footer both
+    # carry the owner's four answers ('justified', 'reason', 'cost',
+    # 'accuracy') in one shape.
+    base["per_agent_justified"] = _compute_per_agent_justification(trace, base)
+    justified_count = sum(1 for v in base["per_agent_justified"].values()
+                          if isinstance(v, dict) and v.get("justified"))
+    base["agents_justified_count"] = justified_count
+    base["agents_total"] = len(base["per_agent_justified"])
+    base["cost"] = _compute_run_cost(trace)
+    base["per_agent_behavior"] = _compute_per_agent_behavior(trace)
+    return base
+
+
+def _build_agent_value_summary_json(trace_json: str | None) -> str:
+    """Thin wrapper the DB layer calls: trace string -> summary JSON string.
+
+    Empty string when the trace is empty, malformed, or carries no
+    Decision final; so hazards.agent_value_json is always a safe value
+    (blank or a JSON object) and json_extract never raises on read.
+    """
+    if not trace_json:
+        return ""
+    try:
+        trace = json.loads(trace_json)
+    except (TypeError, ValueError):
+        return ""
+    summary = _build_agent_value_summary(trace if isinstance(trace, list) else [])
+    if not summary:
+        return ""
+    return json.dumps(summary, separators=(",", ":"))
 
 
 def format_trace_lines(
@@ -12154,6 +13619,66 @@ def format_trace_lines(
             if waiting >= 0.5:
                 line += f"  waiting_evidence={waiting:.0f}"
             lines.append(line)
+        # Round 22 (4.11.2026): agent value footer. Reader-level answer to
+        # "did the agent earn its compute on this case" without diving into
+        # the trace: tree-only verdict, worker-moved rule hint, LLM's
+        # proposed verdict and the final one, plus the enforcement tag.
+        av = _build_agent_value_summary(trace or [])
+        if av:
+            rt = av.get("rule_tree_action") or "n/a"
+            rtw = av.get("rule_tree_with_worker_action") or "n/a"
+            llm = av.get("llm_proposed_action") or "-"
+            fin = av.get("final_action") or "n/a"
+            parts = [
+                f"rule_tree={rt}",
+                f"with_workers={rtw}",
+                f"llm={llm}",
+                f"final={fin}",
+            ]
+            flags: list[str] = []
+            if av.get("changed_rule_hint"):
+                flags.append("changed_rule_hint")
+            if av.get("profile_llm_changed"):
+                flags.append("profile_llm_changed")
+            if av.get("research_llm_changed"):
+                flags.append("research_llm_changed")
+            if av.get("floor_applied"):
+                fr = av.get("floor_reason") or "unnamed"
+                flags.append(f"floor:{fr}")
+            if av.get("enforcement"):
+                flags.append(f"enforcement:{av['enforcement']}")
+            tail = (f"  flags={','.join(flags)}" if flags else "")
+            lines.append(f"{_INDENT}agent value: " + "  ".join(parts) + tail)
+            # Round 23 (4.11.2026): per-agent justification, the owner reads
+            # this as his main answer to "did every agent earn its compute
+            # on this case". One line per agent, YES/NO + reason slugs.
+            pa = av.get("per_agent_justified") or {}
+            jc = av.get("agents_justified_count", 0)
+            total = av.get("agents_total", 0)
+            lines.append(f"{_INDENT}agent justified: {jc} of {total} agents")
+            for sp in ("sanitize", "signal_extractor", "supervisor",
+                       "profile_builder", "rag_retriever", "decision"):
+                entry = pa.get(sp) or {}
+                flag = "YES" if entry.get("justified") else "NO"
+                reasons = entry.get("reasons") or []
+                reb = entry.get("rebuttals") or []
+                reb_tail = f"  rebuttals={','.join(reb)}" if reb else ""
+                lines.append(
+                    f"{_INDENT}  {sp:17s} {flag:3s}  "
+                    f"{','.join(reasons) or '-'}{reb_tail}"
+                )
+            # Run cost (per case): tokens, wall, and Ollama vs commercial
+            # equivalent so the owner can quote the cost to the city in two
+            # columns without digging into the trace.
+            cost = av.get("cost") or {}
+            lines.append(
+                f"{_INDENT}run cost: llm_calls={cost.get('llm_calls', 0)}  "
+                f"tokens_in={cost.get('tokens_in', 0)}  "
+                f"tokens_out={cost.get('tokens_out', 0)}  "
+                f"wall={cost.get('wall_seconds', 0)}s  "
+                f"ollama_self_hosted=$0.00  "
+                f"commercial_equivalent=${cost.get('cost_commercial_equivalent_usd', 0):.6f}"
+            )
     return lines
 
 
