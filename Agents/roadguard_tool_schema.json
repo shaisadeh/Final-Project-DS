@@ -1,0 +1,23 @@
+{
+    "type": "function",
+    "function": {
+        "name": "query_repair_standards",
+        "description": "Searches the official RoadGuard knowledge base for municipal traffic regulations, road maintenance standards, hazard thresholds, and safety guidelines.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The specific question or search query to run against the knowledge base in English or Hebrew."
+                },
+                "issuing_body": {
+                    "type": "string",
+                    "description": "Optional. Filters the documents by the issuing organization. Supported values: 'Ariel Municipality', 'Jerusalem Municipality', 'Tel Aviv-Yafo Municipality', 'Netivei Israel', 'ASTM International', 'Ayalon Highways'."
+                }
+            },
+            "required": [
+                "query"
+            ]
+        }
+    }
+}
