@@ -1,0 +1,162 @@
+[
+    {
+        "q": "How is the 'Supervision' (סופרויוין) system utilized for caller details popup and what represents 'added value' (ערך מוסף) such as booking centers according to Ariel call center guidelines?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What is the depth threshold for a pothole to be classified as severe?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What information must a call center representative gather from a resident reporting a hazard?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the safety rules and precautions when repairing potholes?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How is alligator cracking identified and what does it indicate?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the emergency response times for highly urgent road hazards?",
+        "type": "in_scope"
+    },
+    {
+        "q": "According to update sheet 5 for Chapter 5121 (דפי עדכון לפרק 5121), what are the compaction requirements using a light manual roller (מכבש ידני קל ללא ריטוט) after emulsion spreading?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the regulations for installing temporary traffic arrangements during road maintenance?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How should the call center agent close a service ticket after the hazard is resolved?",
+        "type": "in_scope"
+    },
+    {
+        "q": "According to Chapter 5104 Update Sheet 10 (פרק 5104 דף עדכון 10), what are the mechanical requirements for Cold Milling Machines (מקרצפות מכניות) regarding tooth spacing (מרווח בין השיניים)?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What is the Pavement Condition Index (PCI) and how does it help in prioritizing repairs?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What warning signs are required in advance of a road repair work zone?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the local specifications for repairing longitudinal cracking?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the technical placement rules for transition stones (אבן מעבר פאזה 1) and curb stones without a phase for accessibility (אבן שפה מונמכת לנכים ללא פאזה)?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the safety sheet (SDS/MSDS) and supervisor training requirements for contractors handling paving products under Chapter 5121?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What is the required lateral distance for placing signs from the curb stone?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How are road defects recorded in the municipal inspection log?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the compaction requirements for subgrade soils during road repairs?",
+        "type": "in_scope"
+    },
+    {
+        "q": "Under what weather conditions should pothole repairs be suspended?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the procedures for handling deep pavement distress and depressions?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How does an Ariel call center operator differentiate between a new report and an existing ticket (פניה קיימת או חדשה) using handling history and WhatsApp logs?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the rules for nighttime road work and illumination?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What is the required curing time before traffic can drive on freshly repaired asphalt?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How are edge cracks repaired on narrow municipal roads?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the concrete pouring and backfilling specifications surrounding municipal drainage inlets (פרט עקרוני למילוי מסביב לקולטן)?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What materials are approved for high-durability pavement markings?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What criteria are used to escalate a pothole to an 'urgent inspection' status?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How is road distress severity rated in standard inspection manuals?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the requirements for retroreflective sheeting on construction signs?",
+        "type": "in_scope"
+    },
+    {
+        "q": "What are the physical assembly specifications and height limits for raising a drainage gully grate (פרט הגבהת קולטן)?",
+        "type": "in_scope"
+    },
+    {
+        "q": "How do I bake a sourdough bread at home?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "Explain the theory of quantum entanglement.",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "What is the best way to invest in the stock market?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "Who won the Formula 1 world championship in 2023?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "What are the best tourist attractions in Tokyo?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "What is the traditional recipe for chocolate chip cookies?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "How do quantum computers process information differently from classical computers?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "How to make a sourdough starter from scratch?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "How to tune a Formula 1 engine for maximum performance?",
+        "type": "out_of_scope"
+    },
+    {
+        "q": "What are the main differences between value investing and day trading?",
+        "type": "out_of_scope"
+    }
+]
